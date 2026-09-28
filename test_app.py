@@ -3,7 +3,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 from openai import AuthenticationError, InternalServerError, RateLimitError
@@ -22,6 +22,8 @@ from app import (
     parse_json_object,
     submit_answer,
     validate_tutorial,
+    build_prompt,
+    contact_html,
 )
 
 
@@ -56,6 +58,21 @@ def generated_payload(language="C", steps=None, source=SOURCE):
 
 
 class TutorialTests(unittest.TestCase):
+    @staticmethod
+    def study_app():
+        return AppTest.from_string(
+            "from app import initialize_state, show_study_view\n"
+            "initialize_state()\nshow_study_view()"
+        ).run(timeout=15)
+
+    @staticmethod
+    def fake_store():
+        store = MagicMock()
+        store.has_key.return_value = True
+        store.get_key.return_value = "test-key"
+        store.insert_tutorial.side_effect = lambda owner, record: {**record, "owner_id": owner}
+        return store
+
     def test_json_fallback_and_schema(self):
         value = payload()
         encoded = json.dumps(value, ensure_ascii=False)
@@ -90,6 +107,16 @@ class TutorialTests(unittest.TestCase):
             finalize_generated_tutorial(
                 generated_payload(steps=[{**STEP, "line_number": 99}]), "C", SOURCE
             )
+
+    def test_seven_question_limit_and_selection_prompt(self):
+        seven = generated_payload(steps=[STEP.copy() for _ in range(7)])
+        self.assertEqual(len(finalize_generated_tutorial(seven, "C", SOURCE).steps), 7)
+        with self.assertRaises(TutorialError):
+            finalize_generated_tutorial(generated_payload(steps=[STEP.copy() for _ in range(8)]), "C", SOURCE)
+        prompt = build_prompt("C", "출력은?", SOURCE)
+        self.assertIn("1~7개", prompt)
+        self.assertIn("단순 상수 초기화", prompt)
+        self.assertIn("이번 실행에서 출력되는 값", prompt)
 
     def test_raw_json_fallback_builds_step_numbers(self):
         response = SimpleNamespace(
@@ -187,7 +214,7 @@ class TutorialTests(unittest.TestCase):
                 self.assertIn('<span class="hll"><span class="linenos">2</span>', rendered)
 
     def test_streamlit_hint_and_completion(self):
-        app = AppTest.from_file("app.py").run()
+        app = self.study_app()
         app.session_state["quiz_data"] = {
             "language": "C",
             "steps": [STEP.copy()],
@@ -211,7 +238,7 @@ class TutorialTests(unittest.TestCase):
         self.assertTrue(any("모든 단계를 완료" in item.value for item in app.success))
 
     def test_streamlit_correct_choice_advances(self):
-        app = AppTest.from_file("app.py").run()
+        app = self.study_app()
         app.session_state["quiz_data"] = {
             "language": "C",
             "steps": [STEP.copy()],
@@ -225,8 +252,8 @@ class TutorialTests(unittest.TestCase):
         self.assertEqual(app.session_state["current_step_idx"], 1)
         self.assertEqual(len(app.exception), 0)
 
-    def test_repeated_line_shows_execution_number(self):
-        app = AppTest.from_file("app.py").run()
+    def test_repeated_line_does_not_claim_total_executions(self):
+        app = self.study_app()
         app.session_state["quiz_data"] = {
             "language": "C",
             "steps": [STEP.copy(), {**STEP, "step_number": 2, "answer": "2"}],
@@ -241,13 +268,14 @@ class TutorialTests(unittest.TestCase):
         }
         app.run()
         self.assertEqual(len(app.exception), 0)
-        self.assertTrue(any("총 2회 중 2번째 실행" in item.value for item in app.markdown))
+        self.assertFalse(any("총 2회 중 2번째 실행" in item.value for item in app.markdown))
+        self.assertTrue(any("현재 2행" in item.value for item in app.markdown))
         self.assertTrue(any("직전 1단계 (2행)의 정답" in item.value for item in app.success))
         self.assertTrue(any("지난 단계 다시 보기" in item.label for item in app.expander))
         self.assertEqual(list(app.dataframe[0].value["정답"]), ["1"])
 
     def test_completed_questions_remain_available_for_review(self):
-        app = AppTest.from_file("app.py").run()
+        app = self.study_app()
         app.session_state["quiz_data"] = {
             "language": "C",
             "steps": [STEP.copy(), {**STEP, "step_number": 2, "answer": "2"}],
@@ -264,48 +292,58 @@ class TutorialTests(unittest.TestCase):
         self.assertTrue(any("지난 단계 다시 보기 (2개 완료)" in item.label for item in app.expander))
 
     def test_generation_failure_preserves_study(self):
-        app = AppTest.from_file("app.py").run()
-        app.text_input[0].set_value("test-key")
-        app.text_area[0].set_value("x의 값은?")
-        app.text_area[1].set_value(SOURCE)
-        with patch("openai.OpenAI") as client_class:
-            client_class.return_value.responses.parse.return_value = SimpleNamespace(
-                output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
-            )
-            app.button(key="FormSubmitter:generate_form-Generate Interactive Tutorial").click().run()
-        self.assertEqual(app.session_state["current_step_idx"], 0)
-        self.assertEqual(app.session_state["generation_count"], 1)
-        app.button(key="hint_1_0").click().run()
-        with patch("openai.OpenAI") as client_class:
-            client_class.return_value.responses.parse.return_value = SimpleNamespace(
-                output_parsed=None, status="completed", output_text="bad"
-            )
-            app.button(key="FormSubmitter:generate_form-Generate Interactive Tutorial").click().run()
-        self.assertEqual(app.session_state["generation_count"], 1)
-        self.assertTrue(app.session_state["hint_opened"])
-        self.assertEqual(app.session_state["quiz_data"]["steps"][0]["answer"], "1")
-        self.assertEqual(len(app.exception), 0)
+        store = self.fake_store()
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+            app = AppTest.from_string("import app\napp.main()").run(timeout=15)
+            app.text_area[0].set_value("x의 값은?")
+            app.text_area[1].set_value(SOURCE)
+            with patch("app.OpenAI") as client_class:
+                client_class.return_value.responses.parse.return_value = SimpleNamespace(
+                    output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
+                )
+                app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
+            self.assertEqual(app.session_state["current_step_idx"], 0)
+            self.assertEqual(app.session_state["generation_count"], 2)
+            app.button(key="hint_2_0").click().run(timeout=15)
+            with patch("app.OpenAI") as client_class:
+                client_class.return_value.responses.parse.return_value = SimpleNamespace(
+                    output_parsed=None, status="completed", output_text="bad"
+                )
+                app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
+            self.assertEqual(app.session_state["generation_count"], 2)
+            self.assertTrue(app.session_state["hint_opened"])
+            self.assertEqual(app.session_state["quiz_data"]["steps"][0]["answer"], "1")
+            self.assertEqual(len(app.exception), 0)
 
     def test_streamlit_api_error_details_hide_key(self):
-        app = AppTest.from_file("app.py").run()
-        app.text_input[0].set_value("secret-key")
-        app.text_area[0].set_value("x의 값은?")
-        app.text_area[1].set_value(SOURCE)
-        response = httpx2.Response(
-            429, request=httpx2.Request("POST", "https://example.test/responses")
-        )
-        with patch("openai.OpenAI") as client_class:
-            client_class.return_value.responses.parse.side_effect = RateLimitError(
-                "Too many", response=response,
-                body={"error": {"code": "rate_limit_exceeded", "message": "Busy; key=secret-key"}},
+        store = self.fake_store()
+        store.get_key.return_value = "secret-key"
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+            app = AppTest.from_string("import app\napp.main()").run(timeout=15)
+            app.text_area[0].set_value("x의 값은?")
+            app.text_area[1].set_value(SOURCE)
+            response = httpx2.Response(
+                429, request=httpx2.Request("POST", "https://example.test/responses")
             )
-            app.button(key="FormSubmitter:generate_form-Generate Interactive Tutorial").click().run()
+            with patch("app.OpenAI") as client_class:
+                client_class.return_value.responses.parse.side_effect = RateLimitError(
+                    "Too many", response=response,
+                    body={"error": {"code": "rate_limit_exceeded", "message": "Busy; key=secret-key"}},
+                )
+                app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(any("한도" in item.value for item in app.error))
         self.assertTrue(any("API 오류 상세" in item.label for item in app.expander))
         self.assertEqual(len(app.json), 1)
         self.assertEqual(json.loads(app.json[0].value)["api_status"], "rate_limit_exceeded")
         self.assertNotIn("secret-key", app.json[0].value)
+
+    def test_contact_links_are_encoded(self):
+        html = contact_html("be0128st@gmail.com")
+        self.assertIn("to=be0128st%40gmail.com", html)
+        self.assertIn("subject=%5B%EC%8B%A4%ED%96%89", html)
+        self.assertIn("개발자에게 문의하기", html)
+        self.assertIn("mailto:be0128st@gmail.com", html)
 
 
 if __name__ == "__main__":

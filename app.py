@@ -7,18 +7,33 @@ import logging
 import os
 import re
 import time
+from copy import deepcopy
+from html import escape
 from typing import Any
+from urllib.parse import urlencode
 
 import streamlit as st
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 
+from storage import (
+    ArchiveStore,
+    KeyUnavailable,
+    StorageConflict,
+    StorageError,
+    check_progress,
+    fresh_progress,
+    google_owner,
+    new_tutorial_record,
+)
+
 
 LANGUAGES = {"C": "c", "C++": "cpp", "Java": "java", "Python": "python"}
 DEFAULT_MODEL = "gpt-4.1-mini"
+DEFAULT_CONTACT_EMAIL = "be0128st@gmail.com"
 LOGGER = logging.getLogger("execution_trace_tutor")
 
 
@@ -42,7 +57,7 @@ class GeneratedTutorial(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     language: str
-    steps: list[GeneratedTraceStep]
+    steps: list[GeneratedTraceStep] = Field(min_length=1, max_length=7)
     annotated_code: str
 
 
@@ -71,15 +86,19 @@ def build_prompt(language: str, problem: str, source: str) -> str:
 선택 언어: {language}
 문제 설명: {problem}
 
-아래 원본 소스를 실제 실행 순서대로 추적해 JSON 스키마에 맞춰 답하세요.
+아래 원본 소스를 처음부터 끝까지 실제 실행 순서대로 추적해 JSON 스키마에 맞춰 답하세요.
 소스를 실행했다고 주장하지 말고 언어 규칙에 근거해 분석하세요.
-실제로 실행되는 각 문장과 조건 판단 줄을 빠뜨리지 말고 한 단계씩 만드세요.
-선언, 대입, 분기 조건, 반복 조건과 갱신, 함수 호출, 출력, 반환도 포함하세요.
-빈 줄, 주석, 단독 중괄호처럼 실행할 동작이 없는 줄은 제외하세요.
-분기, 반복, 함수 호출은 실제 실행 순서로 배치하고 반복 방문한 줄은 별도 단계로 넣으세요.
-같은 줄을 여러 번 방문하면 질문에 이번 실행의 반복 변수 값이나 관련 상태를 명시하세요.
+전체 실행을 분석한 뒤 학습 가치가 높은 실행 지점만 1~7개 고르세요.
+짧고 단순한 프로그램에서 7개를 억지로 채우지 마세요. 질문 순서는 실제 실행 순서입니다.
+최종 출력과 문제에서 요구한 결과, 실행 오류 또는 정의되지 않은 동작의 원인을 우선하세요.
+포인터 역참조, 참조 공유, 배열 접근, 함수의 부수 효과, 결과를 바꾸는 분기,
+반복 중 핵심 값 변화와 종료 조건, 슬라이싱·가변 객체의 의미를 우선하세요.
+단순 상수 초기화나 같은 의미의 반복 질문은 낮은 우선순위입니다.
+다만 형 변환·별칭 관계 등 중요한 개념이 있다면 초기화도 질문으로 고를 수 있습니다.
+질문하지 않는 줄과 반복 회차도 실제로 실행된 것으로 계산해 이후 상태에 반영하세요.
+빈 줄, 주석, 단독 중괄호처럼 실행할 동작이 없는 줄은 질문하지 마세요.
+같은 줄을 여러 번 고르면 각 질문에 이번 실행의 반복 변수 값과 관련 상태를 명시하세요.
 출력문은 이번 실행에서 출력되는 값과 지금까지 누적된 출력 결과를 구분해 물으세요.
-같은 줄이 다시 실행되더라도 반복 조건 검사와 갱신 등 사이에 실행되는 단계를 빠뜨리지 마세요.
 line_number는 아래의 1-based 물리적 줄 번호입니다. 단계를 실행 순서대로 나열하세요.
 step_number와 code_line은 앱이 배열 순서와 원본 코드에서 채우므로 작성하지 마세요.
 질문은 해당 줄 실행 전/후 중 어느 시점인지 명시하세요.
@@ -167,6 +186,8 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
 
 def finalize_generated_tutorial(payload: dict[str, Any], language: str, source: str) -> Tutorial:
     """모델이 판단한 줄 번호를 검증하고, 순서와 원문은 앱에서 확정한다."""
+    if isinstance(payload.get("steps"), list) and len(payload["steps"]) > 7:
+        raise TutorialError("문항이 7개를 초과했습니다. 다시 생성해 주세요.")
     try:
         generated = GeneratedTutorial.model_validate(payload)
     except ValidationError as exc:
@@ -276,12 +297,55 @@ def normalize_answer(answer: str) -> str:
     return answer.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
+def current_progress(state: Any) -> dict[str, Any]:
+    """화면 상태에서 저장할 최소한의 풀이 상태를 구성한다."""
+    steps = len(state["quiz_data"]["steps"])
+    outcomes = state.get("outcomes")
+    if outcomes is None:
+        outcomes = fresh_progress(steps)["outcomes"]
+        for number in range(state["current_step_idx"]):
+            outcomes[number]["status"] = "correct"
+    return {
+        "current_step_idx": state["current_step_idx"],
+        "hint_opened": state["hint_opened"],
+        "outcomes": deepcopy(outcomes),
+    }
+
+
+def commit_progress(state: Any, progress: dict[str, Any]) -> None:
+    """원격 저장이 성공한 후에만 화면 상태를 변경한다."""
+    check_progress(progress, len(state["quiz_data"]["steps"]))
+    if state.get("active_record_id"):
+        version = make_store().update_progress(
+            state["owner_id"], state["active_record_id"], state["active_version"], progress
+        )
+        state["active_version"] = version
+    state["current_step_idx"] = progress["current_step_idx"]
+    state["hint_opened"] = progress["hint_opened"]
+    state["outcomes"] = progress["outcomes"]
+    state["needs_reload"] = False
+
+
+def open_hint(state: Any) -> None:
+    """힌트를 저장해 다른 기기에서도 패스 조건을 유지한다."""
+    progress = current_progress(state)
+    if progress["current_step_idx"] >= len(progress["outcomes"]) or progress["hint_opened"]:
+        return
+    progress["hint_opened"] = True
+    commit_progress(state, progress)
+
+
 def advance_step(state: Any, *, passed: bool = False) -> bool:
     """힌트를 열었을 때만 패스하고 한 번만 다음 단계로 이동한다."""
     steps = state["quiz_data"]["steps"]
     index = state["current_step_idx"]
     if index >= len(steps) or (passed and not state["hint_opened"]):
         return False
+    progress = current_progress(state)
+    progress["outcomes"][index]["status"] = "passed" if passed else "correct"
+    progress["current_step_idx"] = index + 1
+    progress["hint_opened"] = False
+    commit_progress(state, progress)
     step = steps[index]
     state["last_result"] = {
         "step_number": index + 1,
@@ -289,8 +353,6 @@ def advance_step(state: Any, *, passed: bool = False) -> bool:
         "answer": step["answer"],
         "explanation": step["explanation"],
     }
-    state["current_step_idx"] = index + 1
-    state["hint_opened"] = False
     state["feedback"] = None
     return True
 
@@ -305,6 +367,9 @@ def submit_answer(state: Any, answer: str) -> bool:
         state["feedback"] = "답을 입력해 주세요."
         return False
     if normalize_answer(answer) != normalize_answer(steps[index]["answer"]):
+        progress = current_progress(state)
+        progress["outcomes"][index]["wrong_count"] += 1
+        commit_progress(state, progress)
         state["feedback"] = "아직 정답이 아닙니다. 다시 생각해 보세요."
         return False
     return advance_step(state)
@@ -319,15 +384,53 @@ def highlight_source(source: str, language: str, line_number: int) -> str:
     return f"<style>{css}\n.trace-code {{overflow-x:auto; padding:0.75rem;}}</style>{code_html}"
 
 
-def resolve_api_key(typed_key: str) -> str:
-    """세션 입력, secrets, 환경변수 순으로 키를 찾는다."""
-    if typed_key.strip():
-        return typed_key.strip()
+def setting(name: str) -> str:
+    """서버 설정만 읽는다. 개인 OpenAI 키의 환경변수 대체는 사용하지 않는다."""
     try:
-        secret = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:  # secrets 파일이 설정되지 않은 로컬 실행도 지원한다.
+        secret = st.secrets.get(name, "")
+    except Exception:
         secret = ""
-    return str(secret or os.getenv("OPENAI_API_KEY", "")).strip()
+    return str(secret or os.getenv(name, "")).strip()
+
+
+def make_store() -> ArchiveStore:
+    return ArchiveStore(
+        setting("SUPABASE_URL"),
+        setting("SUPABASE_SECRET_KEY"),
+        setting("OPENAI_KEY_ENCRYPTION_KEY"),
+    )
+
+
+def contact_html(email: str) -> str:
+    """자바스크립트 없이 키보드로도 여는 문의 버튼을 만든다."""
+    subject = "[실행 추적 튜터] 문의"
+    gmail = "https://mail.google.com/mail/?" + urlencode(
+        {"view": "cm", "fs": "1", "to": email, "su": subject}
+    )
+    mailto = "mailto:" + email + "?" + urlencode({"subject": subject})
+    return f"""
+<style>
+.contact-float {{position:fixed;right:max(16px,env(safe-area-inset-right));
+bottom:max(16px,env(safe-area-inset-bottom));z-index:9999;font-family:Arial,sans-serif}}
+.contact-float summary {{display:flex;align-items:center;justify-content:center;width:56px;
+height:56px;float:right;border-radius:50%;background:#2554b8;color:white;
+box-shadow:0 3px 12px #0004;cursor:pointer;list-style:none;font-size:25px}}
+.contact-float summary::-webkit-details-marker {{display:none}}
+.contact-float summary:focus-visible,.contact-float a:focus-visible {{outline:3px solid #ffb000;outline-offset:2px}}
+.contact-panel {{clear:both;position:absolute;right:0;bottom:68px;width:min(290px,calc(100vw - 32px));
+padding:16px;border-radius:12px;background:white;color:#202432;box-shadow:0 4px 22px #0004}}
+.contact-panel a {{display:block;margin-top:10px;padding:10px;border-radius:7px;background:#eef3ff;
+color:#123f96;text-align:center;text-decoration:none;font-weight:600}}
+.contact-panel small {{display:block;margin-top:10px;overflow-wrap:anywhere}}
+@media(max-width:600px) {{.contact-float {{bottom:max(20px,env(safe-area-inset-bottom))}}}}
+</style>
+<details class="contact-float"><summary aria-label="개발자에게 문의하기" title="개발자에게 문의하기">✉️</summary>
+<div class="contact-panel"><strong>개발자에게 문의하기</strong>
+<a href="{escape(gmail, quote=True)}" target="_blank" rel="noopener noreferrer">Gmail로 문의하기</a>
+<a href="{escape(mailto, quote=True)}">기본 메일 앱으로 열기</a>
+<small>받는 사람: {escape(email)}</small></div></details>
+<style>.stMainBlockContainer {{padding-bottom:100px}}</style>
+"""
 
 
 def initialize_state() -> None:
@@ -343,10 +446,82 @@ def initialize_state() -> None:
         "study_language": "",
         "study_source": "",
         "generation_seconds": None,
+        "outcomes": None,
+        "active_record_id": None,
+        "active_version": 0,
+        "owner_id": None,
+        "view": "학습",
+        "pending_generation": None,
+        "delete_candidate": None,
+        "needs_reload": False,
+        "archive_limit": 100,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def reset_study(state: Any) -> None:
+    """계정 변경이나 현재 기록 삭제 때 이전 사용자 내용을 지운다."""
+    for key, value in {
+        "quiz_data": None,
+        "current_step_idx": 0,
+        "hint_opened": False,
+        "outcomes": None,
+        "feedback": None,
+        "last_result": None,
+        "completed_celebrated": False,
+        "study_problem": "",
+        "study_language": "",
+        "study_source": "",
+        "generation_seconds": None,
+        "active_record_id": None,
+        "active_version": 0,
+        "pending_generation": None,
+        "delete_candidate": None,
+        "needs_reload": False,
+    }.items():
+        state[key] = value
+    state["generation_count"] += 1
+    state["archive_limit"] = 100
+
+
+def apply_record(state: Any, record: dict[str, Any]) -> None:
+    """소유자·원본 줄 번호·진행 상태를 검사한 뒤 기록을 연다."""
+    if record.get("owner_id") != state["owner_id"]:
+        raise StorageError("이 문제 기록을 열 수 없습니다.")
+    try:
+        problem, language, source = record["problem"], record["language"], record["source"]
+        tutorial = validate_tutorial(record["quiz"], language, source)
+        progress = check_progress(record["progress"], len(tutorial.steps))
+        record_id, version = record["id"], record["version"]
+    except (KeyError, TypeError, ValueError, TutorialError) as exc:
+        raise StorageError("저장된 문제 기록을 읽을 수 없습니다.") from None
+    state["quiz_data"] = tutorial.model_dump()
+    state["current_step_idx"] = progress["current_step_idx"]
+    state["hint_opened"] = progress["hint_opened"]
+    state["outcomes"] = deepcopy(progress["outcomes"])
+    state["active_record_id"] = record_id
+    state["active_version"] = version
+    state["study_problem"] = problem
+    state["study_language"] = language
+    state["study_source"] = source
+    state["feedback"] = None
+    state["completed_celebrated"] = progress["current_step_idx"] >= len(tutorial.steps)
+    state["generation_seconds"] = None
+    state["generation_count"] += 1
+    state["needs_reload"] = False
+    index = progress["current_step_idx"]
+    if index:
+        step = tutorial.steps[index - 1]
+        state["last_result"] = {
+            "step_number": index,
+            "line_number": step.line_number,
+            "answer": step.answer,
+            "explanation": step.explanation,
+        }
+    else:
+        state["last_result"] = None
 
 
 def show_review_history(steps: list[dict[str, Any]], completed: int, language: str) -> None:
@@ -361,6 +536,10 @@ def show_review_history(steps: list[dict[str, Any]], completed: int, language: s
                     "행": step["line_number"],
                     "질문": step["question"],
                     "정답": step["answer"],
+                    "진행": (
+                        "패스" if st.session_state.get("outcomes")
+                        and st.session_state["outcomes"][number]["status"] == "passed" else "정답"
+                    ),
                 }
                 for number, step in enumerate(steps[:completed])
             ],
@@ -417,62 +596,128 @@ def show_study_view() -> None:
     step = steps[index]
     st.progress((index + 1) / len(steps), text=f"{index + 1} / {len(steps)}단계")
     st.html(highlight_source(st.session_state["study_source"], language, step["line_number"]))
-    visit_count = sum(item["line_number"] == step["line_number"] for item in steps)
-    visit_number = sum(item["line_number"] == step["line_number"] for item in steps[:index + 1])
-    current = f"현재 {step['line_number']}행"
-    if visit_count > 1:
-        current += f" (총 {visit_count}회 중 {visit_number}번째 실행)"
-    st.write(f"**{current}:** {step['question']}")
+    st.write(f"**현재 {step['line_number']}행:** {step['question']}")
 
     # 휴대전화에서도 한 번 탭하면 채점되도록 선택지를 버튼으로 표시한다.
     for choice_number, choice in enumerate(step["choices"], start=1):
         key = f"choice_{st.session_state['generation_count']}_{index}_{choice_number}"
         if st.button(f"{choice_number}. {choice}", key=key, width="stretch"):
-            if submit_answer(st.session_state, choice):
-                st.rerun()
+            try:
+                if submit_answer(st.session_state, choice):
+                    st.rerun()
+            except StorageError as exc:
+                st.error(str(exc))
+                if isinstance(exc, StorageConflict):
+                    st.session_state["needs_reload"] = True
 
     if st.session_state["feedback"]:
         st.warning(st.session_state["feedback"])
 
     if st.button("💡 Show Hint", key=f"hint_{st.session_state['generation_count']}_{index}"):
-        st.session_state["hint_opened"] = True
+        try:
+            open_hint(st.session_state)
+        except StorageError as exc:
+            st.error(str(exc))
+            if isinstance(exc, StorageConflict):
+                st.session_state["needs_reload"] = True
     if st.session_state["hint_opened"]:
         st.info(step["hint"])
         if st.button("➡️ Next Line (Pass)", key=f"pass_{st.session_state['generation_count']}_{index}"):
-            if advance_step(st.session_state, passed=True):
-                st.rerun()
+            try:
+                if advance_step(st.session_state, passed=True):
+                    st.rerun()
+            except StorageError as exc:
+                st.error(str(exc))
+                if isinstance(exc, StorageConflict):
+                    st.session_state["needs_reload"] = True
+
+    if st.session_state.get("needs_reload") and st.button("최신 풀이 상태 불러오기"):
+        try:
+            record = make_store().get_tutorial(st.session_state["owner_id"], st.session_state["active_record_id"])
+            apply_record(st.session_state, record)
+            st.session_state["needs_reload"] = False
+            st.rerun()
+        except StorageError as exc:
+            st.error(str(exc))
 
 
-def main() -> None:
-    st.set_page_config(page_title="실행 추적 튜터", page_icon="🧭", layout="wide")
-    initialize_state()
-    st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python")
+def show_key_settings(store: ArchiveStore, owner: str) -> str:
+    """개인 키를 한 번 등록하고 이후에는 상태만 보여준다."""
+    st.subheader("OpenAI 설정")
+    try:
+        registered = store.has_key(owner)
+    except StorageError as exc:
+        st.error(str(exc))
+        registered = False
+    if registered:
+        st.success("개인 API 키 등록됨")
+    with st.form("key_form", clear_on_submit=True):
+        new_key = st.text_input(
+            "API 키 등록·변경", type="password", autocomplete="off",
+            help="한 번 등록하면 같은 Google 계정으로 다른 기기에서도 사용할 수 있습니다.",
+            key=f"api_key_input_{owner}",
+        )
+        save_key = st.form_submit_button("API 키 저장")
+    if save_key:
+        try:
+            store.save_key(owner, new_key)
+        except StorageError as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+    if registered and st.button("저장된 API 키 삭제"):
+        try:
+            store.delete_key(owner)
+        except StorageError as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+    return st.text_input("모델", value=DEFAULT_MODEL, key="openai_model")
 
-    with st.sidebar:
-        st.subheader("OpenAI 설정")
-        typed_key = st.text_input("OpenAI API 키", type="password", key="openai_api_key", help="입력한 키는 현재 세션에서만 사용합니다.")
-        model = st.text_input("모델", value=DEFAULT_MODEL, key="openai_model")
 
+def save_pending_generation(store: ArchiveStore, owner: str) -> None:
+    """API 재호출 없이 생성된 결과를 저장한다."""
+    pending = st.session_state["pending_generation"]
+    if not pending:
+        return
+    st.warning("생성된 문제를 아직 보관하지 못했습니다. 저장을 다시 시도할 수 있습니다.")
+    if st.button("생성된 문제 저장 다시 시도"):
+        try:
+            record = store.insert_tutorial(owner, pending)
+            apply_record(st.session_state, record)
+        except (StorageError, TutorialError) as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["pending_generation"] = None
+            st.rerun()
+    if st.button("저장하지 않고 버리기"):
+        st.session_state["pending_generation"] = None
+        st.rerun()
+
+
+def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
+    """생성 결과가 보관된 뒤에만 현재 학습을 교체한다."""
     with st.form("generate_form"):
-        language = st.selectbox("프로그래밍 언어", list(LANGUAGES))
-        problem = st.text_area("문제 설명", placeholder="예: 다음 프로그램의 실행 결과는?")
-        source = st.text_area("소스 코드", height=260, placeholder="코드를 여기에 붙여 넣으세요.")
-        requested = st.form_submit_button("Generate Interactive Tutorial")
+        language = st.selectbox("프로그래밍 언어", list(LANGUAGES), key=f"language_input_{owner}")
+        problem = st.text_area("문제 설명", placeholder="예: 다음 프로그램의 실행 결과는?", key=f"problem_input_{owner}")
+        source = st.text_area("소스 코드", height=260, placeholder="코드를 여기에 붙여 넣으세요.", key=f"source_input_{owner}")
+        requested = st.form_submit_button("핵심 문제 생성")
 
     if requested:
-        api_key = resolve_api_key(typed_key)
-        if not problem.strip() or not source.strip():
+        if st.session_state["pending_generation"]:
+            st.error("먼저 생성된 문제를 저장하거나 버려 주세요.")
+        elif not problem.strip() or not source.strip():
             st.error("문제 설명과 소스 코드를 모두 입력해 주세요.")
         elif not model.strip():
             st.error("모델 이름을 입력해 주세요.")
-        elif not api_key:
-            st.error("OpenAI API 키를 입력하거나 OPENAI_API_KEY를 설정해 주세요.")
         else:
             started = time.perf_counter()
             try:
-                with st.spinner("실행 줄마다 3지선다와 주석 코드를 만드는 중입니다. 반복문이 많으면 시간이 걸릴 수 있습니다..."):
+                api_key = store.get_key(owner)
+                with st.spinner("전체 실행을 분석하고 핵심 문항을 고르는 중입니다..."):
                     tutorial = generate_tutorial(api_key, model.strip(), language, problem, source)
+            except StorageError as exc:
+                st.error(str(exc))
             except TutorialError as exc:
                 st.error(str(exc))
                 st.caption(f"요청 경과 시간: {time.perf_counter() - started:.1f}초")
@@ -480,20 +725,148 @@ def main() -> None:
                     with st.expander("API 오류 상세 (키 제외)"):
                         st.json(exc.diagnostics)
             else:
-                # 검증이 끝나야 기존 학습을 새 내용으로 교체한다.
-                st.session_state["quiz_data"] = tutorial.model_dump()
-                st.session_state["current_step_idx"] = 0
-                st.session_state["hint_opened"] = False
-                st.session_state["generation_count"] += 1
-                st.session_state["feedback"] = None
-                st.session_state["last_result"] = None
-                st.session_state["completed_celebrated"] = False
-                st.session_state["study_problem"] = problem
-                st.session_state["study_language"] = language
-                st.session_state["study_source"] = source
-                st.session_state["generation_seconds"] = time.perf_counter() - started
+                record = new_tutorial_record(problem, language, source, model.strip(), tutorial.model_dump())
+                st.session_state["pending_generation"] = record
+                try:
+                    saved = store.insert_tutorial(owner, record)
+                    apply_record(st.session_state, saved)
+                except (StorageError, TutorialError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["pending_generation"] = None
+                    st.session_state["generation_seconds"] = time.perf_counter() - started
+                    st.rerun()
 
+    save_pending_generation(store, owner)
     show_study_view()
+
+
+def show_archive_view(store: ArchiveStore, owner: str) -> None:
+    st.subheader("내 문제 보관함")
+    try:
+        records = store.list_tutorials(owner, st.session_state["archive_limit"])
+    except StorageError as exc:
+        st.error(str(exc))
+        return
+    language_filter = st.selectbox("언어 필터", ["전체", *LANGUAGES], key="archive_language")
+    status_filter = st.selectbox("진행 상태", ["전체", "진행 중", "완료"], key="archive_status")
+    shown = 0
+    for summary in records:
+        progress = summary.get("progress") or {}
+        outcomes = progress.get("outcomes") or []
+        completed = progress.get("current_step_idx") == len(outcomes) and bool(outcomes)
+        if language_filter != "전체" and summary["language"] != language_filter:
+            continue
+        if (status_filter == "완료" and not completed) or (status_filter == "진행 중" and completed):
+            continue
+        shown += 1
+        record_id = summary["id"]
+        state_label = "완료" if completed else f"진행 중 ({progress.get('current_step_idx', 0)}/{len(outcomes)})"
+        title = summary["problem"].strip().splitlines()[0][:55]
+        with st.expander(f"{summary['language']} · {state_label} · {title}"):
+            st.caption(f"마지막 학습: {summary.get('updated_at', '')[:16]}")
+            if st.button("열기·복습" if completed else "이어 풀기", key=f"open_{record_id}"):
+                try:
+                    record = store.get_tutorial(owner, record_id)
+                    apply_record(st.session_state, record)
+                except (StorageError, TutorialError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["view"] = "학습"
+                    st.rerun()
+            if st.button("다시 풀기", key=f"replay_{record_id}"):
+                try:
+                    original = store.get_tutorial(owner, record_id)
+                    validate_tutorial(original["quiz"], original["language"], original["source"])
+                    replay = new_tutorial_record(
+                        original["problem"], original["language"], original["source"],
+                        original["model"], original["quiz"],
+                    )
+                    st.session_state["pending_generation"] = replay
+                    saved = store.insert_tutorial(owner, replay)
+                    apply_record(st.session_state, saved)
+                except (StorageError, TutorialError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["pending_generation"] = None
+                    st.session_state["view"] = "학습"
+                    st.rerun()
+            if st.button("삭제", key=f"delete_{record_id}"):
+                st.session_state["delete_candidate"] = record_id
+            if st.session_state["delete_candidate"] == record_id:
+                st.warning("이 문제와 풀이 기록을 삭제할까요?")
+                if st.button("삭제 확인", key=f"confirm_{record_id}"):
+                    try:
+                        store.delete_tutorial(owner, record_id)
+                    except StorageError as exc:
+                        st.error(str(exc))
+                    else:
+                        if st.session_state["active_record_id"] == record_id:
+                            reset_study(st.session_state)
+                        st.session_state["delete_candidate"] = None
+                        st.rerun()
+    if not shown:
+        st.info("표시할 문제 기록이 없습니다.")
+    if len(records) == st.session_state["archive_limit"] and st.button("더 보기"):
+        st.session_state["archive_limit"] += 100
+        st.rerun()
+
+
+def main() -> None:
+    st.set_page_config(page_title="실행 추적 튜터", page_icon="🧭", layout="wide")
+    initialize_state()
+    st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
+    st.title("다국어 실행 추적 튜터")
+    st.caption("C · C++ · Java · Python")
+
+    owner = google_owner(st.user)
+    if not owner:
+        if getattr(st.user, "is_logged_in", False):
+            st.error("Google 계정 정보를 확인할 수 없습니다. 다시 로그인해 주세요.")
+            if st.button("로그아웃"):
+                st.logout()
+        else:
+            st.write("Google 계정으로 로그인해 본인 문제와 API 키를 불러오세요.")
+            if st.button("Google 로그인"):
+                try:
+                    st.login()
+                except Exception:
+                    st.error("Google 로그인 설정을 확인해 주세요.")
+        st.stop()
+
+    if st.session_state["owner_id"] != owner:
+        previous_owner = st.session_state["owner_id"]
+        reset_study(st.session_state)
+        if previous_owner:
+            for prefix in ("api_key_input", "language_input", "problem_input", "source_input"):
+                st.session_state.pop(f"{prefix}_{previous_owner}", None)
+        st.session_state["owner_id"] = owner
+        st.session_state["view"] = "학습"
+    try:
+        store = make_store()
+    except StorageError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    with st.sidebar:
+        st.write(st.user.get("email", "Google 계정"))
+        if st.button("로그아웃"):
+            reset_study(st.session_state)
+            st.logout()
+        model = show_key_settings(store, owner)
+
+    left, right = st.columns(2)
+    with left:
+        if st.button("학습", width="stretch"):
+            st.session_state["view"] = "학습"
+    with right:
+        if st.button("내 문제 보관함", width="stretch"):
+            st.session_state["view"] = "보관함"
+
+    if st.session_state["view"] == "보관함":
+        show_archive_view(store, owner)
+    else:
+        show_generate_view(store, owner, model)
 
 
 if __name__ == "__main__":
