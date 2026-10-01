@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
-from openai import AuthenticationError, InternalServerError, RateLimitError
+from openai import AuthenticationError, BadRequestError, InternalServerError, RateLimitError
 import httpx2
 
 from app import (
@@ -168,6 +168,18 @@ class TutorialTests(unittest.TestCase):
                     finalize_generated_tutorial(generated, "C", SOURCE)
                 self.assertEqual(raised.exception.diagnostics["reason"], reason)
 
+    def test_correct_choice_number_is_checked_locally(self):
+        generated = generated_payload()
+        generated["steps"][0]["correct_choice_number"] = 4
+        self.assertNotIn(
+            "enum",
+            GeneratedTutorial.model_json_schema()["$defs"]["GeneratedTraceStep"]
+            ["properties"]["correct_choice_number"],
+        )
+        with self.assertRaises(TutorialError) as raised:
+            finalize_generated_tutorial(generated, "C", SOURCE)
+        self.assertEqual(raised.exception.diagnostics["reason"], "정답 번호가 1~3 범위를 벗어남")
+
     def test_raw_json_fallback_builds_step_numbers(self):
         response = SimpleNamespace(
             output_parsed=None,
@@ -207,6 +219,16 @@ class TutorialTests(unittest.TestCase):
                 exc = cls("Failure", response=response, body={"error": {"message": "Failure"}})
                 self.assertEqual(api_error_diagnostics(exc, "test-key", "gpt-4.1-mini")["http_status"], code)
                 self.assertIn("OpenAI", describe_api_error(exc))
+
+    def test_schema_400_identifies_app_error(self):
+        response = httpx2.Response(
+            400, request=httpx2.Request("POST", "https://example.test/responses")
+        )
+        exc = BadRequestError(
+            "Bad request", response=response,
+            body={"error": {"message": "Invalid schema for response_format", "param": "text.format.schema"}},
+        )
+        self.assertIn("앱의 OpenAI 응답 형식", describe_api_error(exc))
 
     def test_invalid_trace_is_rejected(self):
         cases = [

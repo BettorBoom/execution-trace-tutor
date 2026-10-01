@@ -9,7 +9,7 @@ import re
 import time
 from copy import deepcopy
 from html import escape
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 import streamlit as st
@@ -43,7 +43,7 @@ class GeneratedTraceStep(BaseModel):
     line_number: int
     question: str
     choices: list[str]
-    correct_choice_number: Literal[1, 2, 3]
+    correct_choice_number: int
     hint: str
     explanation: str
 
@@ -223,6 +223,8 @@ def finalize_generated_tutorial(payload: dict[str, Any], language: str, source: 
         if not 1 <= step.line_number <= len(lines):
             raise TutorialError("모델 응답의 줄 번호가 원본 코드 밖에 있습니다. 다시 생성해 주세요.")
         check_choices(step.choices, number)
+        if not 1 <= step.correct_choice_number <= 3:
+            raise ChoiceValidationError(number, "정답 번호가 1~3 범위를 벗어남")
         steps.append(
             TraceStep(
                 **step.model_dump(exclude={"correct_choice_number"}),
@@ -260,8 +262,19 @@ def describe_api_error(exc: Exception) -> str:
         return "OpenAI 서버에서 오류가 발생했습니다(500). 아래 오류 상세를 확인해 주세요."
     if code in (408, 504) or "timeout" in name:
         return "OpenAI 응답 시간이 초과됐습니다. 다시 시도해 주세요."
-    if code == 400 or code == 404:
-        return "OpenAI 요청 또는 모델 이름을 확인해 주세요."
+    if code == 400:
+        body = getattr(exc, "body", None)
+        error = body.get("error", body) if isinstance(body, dict) else {}
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "").lower()
+            parameter = str(error.get("param") or "").lower()
+            if "schema" in detail or "schema" in parameter:
+                return "앱의 OpenAI 응답 형식에 문제가 있습니다. 아래 오류 상세를 확인해 주세요."
+            if error.get("code") == "model_not_found" or parameter == "model":
+                return "OpenAI 모델 이름 또는 접근 권한을 확인해 주세요."
+        return "OpenAI가 요청을 거부했습니다(400). 아래 오류 상세를 확인해 주세요."
+    if code == 404:
+        return "OpenAI 모델 이름 또는 접근 권한을 확인해 주세요."
     if code is not None and code >= 500:
         return f"OpenAI 서버 오류({code})가 발생했습니다. 아래 오류 상세를 확인해 주세요."
     if "connect" in name or "network" in name:
