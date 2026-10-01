@@ -9,7 +9,7 @@ import re
 import time
 from copy import deepcopy
 from html import escape
-from typing import Any
+from typing import Any, Callable, Literal
 from urllib.parse import urlencode
 
 import streamlit as st
@@ -43,12 +43,20 @@ class GeneratedTraceStep(BaseModel):
     line_number: int
     question: str
     choices: list[str]
-    answer: str
+    correct_choice_number: Literal[1, 2, 3]
     hint: str
     explanation: str
 
 
-class TraceStep(GeneratedTraceStep):
+class TraceStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    line_number: int
+    question: str
+    choices: list[str]
+    answer: str
+    hint: str
+    explanation: str
     step_number: int
     code_line: str
 
@@ -77,6 +85,16 @@ class TutorialError(Exception):
         self.diagnostics = diagnostics
 
 
+class ChoiceValidationError(TutorialError):
+    """선택지만 잘못 생성된 경우 재시도할 수 있도록 구분한다."""
+
+    def __init__(self, step_number: int, reason: str):
+        super().__init__(
+            f"{step_number}번 문항의 선택지에 문제가 있습니다. 다시 생성해 주세요.",
+            {"step_number": step_number, "reason": reason},
+        )
+
+
 def build_prompt(language: str, problem: str, source: str) -> str:
     """물리적 줄 번호와 실제 실행 순서를 모델에 분명히 전달한다."""
     numbered_source = "\n".join(
@@ -102,9 +120,10 @@ def build_prompt(language: str, problem: str, source: str) -> str:
 line_number는 아래의 1-based 물리적 줄 번호입니다. 단계를 실행 순서대로 나열하세요.
 step_number와 code_line은 앱이 배열 순서와 원본 코드에서 채우므로 작성하지 마세요.
 질문은 해당 줄 실행 전/후 중 어느 시점인지 명시하세요.
-choices에는 서로 다른 짧은 선택지 정확히 3개를 넣고, 그중 한 개만 정답이 되게 하세요.
-answer는 정답 선택지의 문구를 그대로 복사하세요. 오답 두 개도 그럴듯하게 작성하고
-정답 위치가 항상 같지 않게 하세요. 질문, 힌트, 설명은 간결하게 작성하세요.
+choices에는 서로 다른 짧은 선택지 정확히 3개를 넣고, 선택지 안에는 번호를 쓰지 마세요.
+correct_choice_number는 정답 선택지의 1부터 3까지의 번호입니다. 정답 문구를 별도로 쓰지 마세요.
+오답 두 개도 그럴듯하게 작성하고 정답 위치가 항상 같지 않게 하세요.
+질문, 힌트, 설명은 간결하게 작성하세요.
 힌트는 정답을 직접 말하지 않고 단서를 주세요. 설명은 왜 그 답인지 알려 주세요.
 C/C++의 포인터·메모리·정수 규칙, Java의 참조·배열, Python의 렉시컬 스코프(LEGB)·
 가변 객체·슬라이싱 등 해당 코드에 실제로 필요한 언어 규칙만 적용하세요.
@@ -151,6 +170,19 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def check_choices(choices: list[str], step_number: int, answer: str | None = None) -> None:
+    """선택지 자체와 보관함에 저장된 정답의 일치 여부를 확인한다."""
+    normalized = [normalize_answer(choice) for choice in choices]
+    if len(normalized) != 3:
+        raise ChoiceValidationError(step_number, "선택지 개수가 3개가 아님")
+    if any(not choice for choice in normalized):
+        raise ChoiceValidationError(step_number, "빈 선택지 있음")
+    if len(set(normalized)) != 3:
+        raise ChoiceValidationError(step_number, "중복 선택지 있음")
+    if answer is not None and normalized.count(normalize_answer(answer)) != 1:
+        raise ChoiceValidationError(step_number, "정답이 선택지와 일치하지 않음")
+
+
 def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tutorial:
     """구조뿐 아니라 화면에 표시할 소스 위치도 검사한다."""
     try:
@@ -173,14 +205,7 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
             for value in (step.question, step.answer, step.hint, step.explanation)
         ):
             raise TutorialError("모델 응답에 빈 질문이나 답변이 있습니다. 다시 생성해 주세요.")
-        choices = [normalize_answer(choice) for choice in step.choices]
-        if (
-            len(choices) != 3
-            or any(not choice for choice in choices)
-            or len(set(choices)) != 3
-            or choices.count(normalize_answer(step.answer)) != 1
-        ):
-            raise TutorialError("모델 응답의 3지선다 선택지가 올바르지 않습니다. 다시 생성해 주세요.")
+        check_choices(step.choices, expected_number, step.answer)
     return tutorial
 
 
@@ -197,9 +222,11 @@ def finalize_generated_tutorial(payload: dict[str, Any], language: str, source: 
     for number, step in enumerate(generated.steps, start=1):
         if not 1 <= step.line_number <= len(lines):
             raise TutorialError("모델 응답의 줄 번호가 원본 코드 밖에 있습니다. 다시 생성해 주세요.")
+        check_choices(step.choices, number)
         steps.append(
             TraceStep(
-                **step.model_dump(),
+                **step.model_dump(exclude={"correct_choice_number"}),
+                answer=step.choices[step.correct_choice_number - 1],
                 step_number=number,
                 code_line=lines[step.line_number - 1],
             )
@@ -268,28 +295,56 @@ def api_error_diagnostics(exc: Exception, api_key: str, model: str) -> dict[str,
     }
 
 
-def generate_tutorial(api_key: str, model: str, language: str, problem: str, source: str) -> Tutorial:
-    """구조화 응답을 받은 뒤 검증된 튜토리얼만 반환한다."""
+def generate_tutorial(
+    api_key: str,
+    model: str,
+    language: str,
+    problem: str,
+    source: str,
+    on_retry: Callable[[], None] | None = None,
+) -> Tutorial:
+    """선택지 오류에만 한 번 더 요청하고 검증된 튜토리얼을 반환한다."""
     started = time.perf_counter()
     try:
         # 긴 자동 재시도로 사용자가 기다리지 않도록 제한한다.
         client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
-        response = client.responses.parse(
-            model=model,
-            input=build_prompt(language, problem, source),
-            text_format=GeneratedTutorial,
-            store=False,
-        )
+        prompt = build_prompt(language, problem, source)
+        for attempt in range(2):
+            response = client.responses.parse(
+                model=model,
+                input=prompt,
+                text_format=GeneratedTutorial,
+                store=False,
+            )
+            if response.status == "incomplete":
+                raise TutorialError("OpenAI 응답이 중간에 끊겼습니다. 코드를 줄여 다시 생성해 주세요.")
+            try:
+                payload = (
+                    response.output_parsed.model_dump()
+                    if response.output_parsed is not None
+                    else parse_json_object(response.output_text)
+                )
+                return finalize_generated_tutorial(payload, language, source)
+            except ChoiceValidationError as exc:
+                if attempt:
+                    exc.diagnostics["retry_count"] = 1
+                    LOGGER.warning("선택지 재생성 실패: %s", json.dumps(exc.diagnostics, ensure_ascii=False))
+                    raise
+                if on_retry:
+                    on_retry()
+                prompt += (
+                    "\n\n앞선 응답의 선택지에 오류가 있어 폐기했습니다. "
+                    "선택지를 정확히 3개 만들고, 빈 문구나 중복 문구가 없는지 확인한 뒤 "
+                    "정답의 번호만 correct_choice_number에 적으세요."
+                )
+        raise AssertionError("재시도 횟수를 초과했습니다.")
+    except TutorialError:
+        raise
     except Exception as exc:
         diagnostics = api_error_diagnostics(exc, api_key, model)
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 1)
         LOGGER.error("OpenAI 요청 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
         raise TutorialError(describe_api_error(exc), diagnostics) from None
-    if response.status == "incomplete":
-        raise TutorialError("OpenAI 응답이 중간에 끊겼습니다. 코드를 줄여 다시 생성해 주세요.")
-    if response.output_parsed is not None:
-        return finalize_generated_tutorial(response.output_parsed.model_dump(), language, source)
-    return finalize_generated_tutorial(parse_json_object(response.output_text), language, source)
 
 
 def normalize_answer(answer: str) -> str:
@@ -712,17 +767,21 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
             st.error("모델 이름을 입력해 주세요.")
         else:
             started = time.perf_counter()
+            retry_notice = st.empty()
             try:
                 api_key = store.get_key(owner)
                 with st.spinner("전체 실행을 분석하고 핵심 문항을 고르는 중입니다..."):
-                    tutorial = generate_tutorial(api_key, model.strip(), language, problem, source)
+                    tutorial = generate_tutorial(
+                        api_key, model.strip(), language, problem, source,
+                        on_retry=lambda: retry_notice.info("선택지 오류가 있어 한 번 더 생성하고 있습니다..."),
+                    )
             except StorageError as exc:
                 st.error(str(exc))
             except TutorialError as exc:
                 st.error(str(exc))
                 st.caption(f"요청 경과 시간: {time.perf_counter() - started:.1f}초")
                 if exc.diagnostics:
-                    with st.expander("API 오류 상세 (키 제외)"):
+                    with st.expander("생성 오류 상세 (키 제외)"):
                         st.json(exc.diagnostics)
             else:
                 record = new_tutorial_record(problem, language, source, model.strip(), tutorial.model_dump())
@@ -736,6 +795,8 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
                     st.session_state["pending_generation"] = None
                     st.session_state["generation_seconds"] = time.perf_counter() - started
                     st.rerun()
+            finally:
+                retry_notice.empty()
 
     save_pending_generation(store, owner)
     show_study_view()

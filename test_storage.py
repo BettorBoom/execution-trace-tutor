@@ -22,7 +22,7 @@ from storage import (
     google_owner,
     new_tutorial_record,
 )
-from test_app import SOURCE, payload
+from test_app import SOURCE, generated_payload, payload
 
 
 class FakeQuery:
@@ -240,11 +240,7 @@ class StorageTests(unittest.TestCase):
 
     def test_generated_result_retries_database_without_openai(self):
         self.store.save_key("google:a", "sk-a")
-        parsed = GeneratedTutorial.model_validate({
-            "language": "C",
-            "steps": [{key: value for key, value in payload()["steps"][0].items() if key not in ("step_number", "code_line")}],
-            "annotated_code": SOURCE + "// 복습",
-        })
+        parsed = GeneratedTutorial.model_validate(generated_payload())
         with patch("app.google_owner", return_value="google:a"), patch("app.make_store", return_value=self.store), patch("app.OpenAI") as client_class:
             client_class.return_value.responses.parse.return_value = Namespace(output_parsed=parsed, status="completed")
             page = AppTest.from_string("import app\napp.main()").run(timeout=15)

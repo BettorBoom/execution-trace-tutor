@@ -50,10 +50,12 @@ def payload(language="C", steps=None, source=SOURCE):
 
 def generated_payload(language="C", steps=None, source=SOURCE):
     value = payload(language, steps, source)
-    value["steps"] = [
-        {key: item for key, item in step.items() if key not in ("step_number", "code_line")}
-        for step in value["steps"]
-    ]
+    generated_steps = []
+    for step in value["steps"]:
+        generated = {key: item for key, item in step.items() if key not in ("step_number", "code_line", "answer")}
+        generated["correct_choice_number"] = step["choices"].index(step["answer"]) + 1
+        generated_steps.append(generated)
+    value["steps"] = generated_steps
     return value
 
 
@@ -94,6 +96,7 @@ class TutorialTests(unittest.TestCase):
             tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
             request = client_class.return_value.responses.parse.call_args.kwargs
         self.assertEqual(tutorial.steps[0].answer, "1")
+        self.assertNotIn("correct_choice_number", tutorial.steps[0].model_dump())
         self.assertEqual([step.step_number for step in tutorial.steps], [1, 2])
         self.assertEqual([step.code_line for step in tutorial.steps], ["int x = 1;", "int x = 1;"])
         self.assertEqual(request["model"], "gpt-4.1-mini")
@@ -117,6 +120,53 @@ class TutorialTests(unittest.TestCase):
         self.assertIn("1~7개", prompt)
         self.assertIn("단순 상수 초기화", prompt)
         self.assertIn("이번 실행에서 출력되는 값", prompt)
+        self.assertIn("correct_choice_number", prompt)
+
+    def test_answer_comes_from_selected_choice(self):
+        generated = generated_payload()
+        generated["steps"][0]["choices"] = ["0", "2", "1"]
+        generated["steps"][0]["correct_choice_number"] = 3
+        tutorial = finalize_generated_tutorial(generated, "C", SOURCE)
+        self.assertEqual(tutorial.steps[0].answer, "1")
+        self.assertEqual(tutorial.steps[0].choices, ["0", "2", "1"])
+
+    def test_invalid_choices_retry_only_once(self):
+        duplicate = generated_payload()
+        duplicate["steps"][0]["choices"] = ["1", "1", "2"]
+        invalid_response = SimpleNamespace(
+            output_parsed=GeneratedTutorial.model_validate(duplicate), status="completed"
+        )
+        valid_response = SimpleNamespace(
+            output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
+        )
+        retry_notice = MagicMock()
+        with patch("app.OpenAI") as client_class:
+            client_class.return_value.responses.parse.side_effect = [invalid_response, valid_response]
+            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, retry_notice)
+            self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+        self.assertEqual(tutorial.steps[0].answer, "1")
+        retry_notice.assert_called_once_with()
+
+        with patch("app.OpenAI") as client_class:
+            client_class.return_value.responses.parse.return_value = invalid_response
+            with self.assertRaises(TutorialError) as raised:
+                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
+            self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+        self.assertEqual(raised.exception.diagnostics["step_number"], 1)
+        self.assertEqual(raised.exception.diagnostics["reason"], "중복 선택지 있음")
+        self.assertEqual(raised.exception.diagnostics["retry_count"], 1)
+
+    def test_empty_or_missing_choice_is_retryable(self):
+        for choices, reason in (
+            (["0", " ", "2"], "빈 선택지 있음"),
+            (["0", "1"], "선택지 개수가 3개가 아님"),
+        ):
+            with self.subTest(choices=choices):
+                generated = generated_payload()
+                generated["steps"][0]["choices"] = choices
+                with self.assertRaises(TutorialError) as raised:
+                    finalize_generated_tutorial(generated, "C", SOURCE)
+                self.assertEqual(raised.exception.diagnostics["reason"], reason)
 
     def test_raw_json_fallback_builds_step_numbers(self):
         response = SimpleNamespace(
@@ -333,10 +383,30 @@ class TutorialTests(unittest.TestCase):
                 app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
         self.assertEqual(len(app.exception), 0)
         self.assertTrue(any("한도" in item.value for item in app.error))
-        self.assertTrue(any("API 오류 상세" in item.label for item in app.expander))
+        self.assertTrue(any("생성 오류 상세" in item.label for item in app.expander))
         self.assertEqual(len(app.json), 1)
         self.assertEqual(json.loads(app.json[0].value)["api_status"], "rate_limit_exceeded")
         self.assertNotIn("secret-key", app.json[0].value)
+
+    def test_streamlit_choice_error_shows_reason(self):
+        store = self.fake_store()
+        generated = generated_payload()
+        generated["steps"][0]["choices"] = ["1", "1", "2"]
+        invalid = SimpleNamespace(
+            output_parsed=GeneratedTutorial.model_validate(generated), status="completed"
+        )
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+            app = AppTest.from_string("import app\napp.main()").run(timeout=15)
+            app.text_area[0].set_value("x의 값은?")
+            app.text_area[1].set_value(SOURCE)
+            with patch("app.OpenAI") as client_class:
+                client_class.return_value.responses.parse.return_value = invalid
+                app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
+                self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+        self.assertTrue(any("1번 문항" in item.value for item in app.error))
+        self.assertTrue(any("생성 오류 상세" in item.label for item in app.expander))
+        self.assertEqual(json.loads(app.json[0].value)["reason"], "중복 선택지 있음")
+        self.assertIsNone(app.session_state["quiz_data"])
 
     def test_contact_links_are_encoded(self):
         html = contact_html("be0128st@gmail.com")
