@@ -149,9 +149,14 @@ class TutorialTests(unittest.TestCase):
 
         with patch("app.OpenAI") as client_class:
             client_class.return_value.responses.parse.return_value = invalid_response
-            with self.assertRaises(TutorialError) as raised:
-                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
+            with self.assertLogs("execution_trace_tutor", level="WARNING") as logs:
+                with self.assertRaises(TutorialError) as raised:
+                    generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
             self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn('"attempt": 1', logs.output[0])
+        self.assertIn('"attempt": 2', logs.output[1])
+        self.assertNotIn("test-key", " ".join(logs.output))
         self.assertEqual(raised.exception.diagnostics["step_number"], 1)
         self.assertEqual(raised.exception.diagnostics["reason"], "중복 선택지 있음")
         self.assertEqual(raised.exception.diagnostics["retry_count"], 1)

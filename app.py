@@ -339,9 +339,16 @@ def generate_tutorial(
                 )
                 return finalize_generated_tutorial(payload, language, source)
             except ChoiceValidationError as exc:
+                diagnostics = {
+                    **exc.diagnostics,
+                    "model": model,
+                    "attempt": attempt + 1,
+                    "response_id": getattr(response, "id", None) or "",
+                    "elapsed_seconds": round(time.perf_counter() - started, 1),
+                }
+                LOGGER.warning("선택지 검증 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
                 if attempt:
                     exc.diagnostics["retry_count"] = 1
-                    LOGGER.warning("선택지 재생성 실패: %s", json.dumps(exc.diagnostics, ensure_ascii=False))
                     raise
                 if on_retry:
                     on_retry()
