@@ -2,6 +2,8 @@
 
 C, C++, Java, Python 코드를 분석해 **최대 7개 핵심 3지선다 문항**을 만듭니다. Google 로그인 후 각자의 OpenAI API 키를 한 번 등록하면 PC와 휴대전화에서 문제를 이어 풀고 복습할 수 있습니다. 사용자의 코드를 실행하지 않고 모델이 분석합니다.
 
+새 학습 형식(v2)은 모델이 제시한 정답·오답·값 변화·간단한 정수 계산을 앱에서 대조합니다. 정답이나 패스 뒤에는 현재 행을 유지하며 **맞았습니다! / 패스했습니다**, 정답, 값 변화와 해설을 표시하고, 사용자가 **다음 문제**를 눌러야 이동합니다. 생성 작업은 백그라운드에서 실행되므로 대기 중에도 화면을 사용할 수 있습니다. 모델 출력이 잘못되면 한 번만 자동 재생성합니다. 기존 보관함의 문제는 그대로 열 수 있지만 새 검증을 거친 것으로 표시하지 않으며, 원본 코드로 새 형식을 다시 생성할 수 있습니다.
+
 ## 필요한 서비스 설정
 
 1. **Supabase:** [프로젝트 목록](https://supabase.com/dashboard/projects)에서 이 앱 전용 프로젝트 `execution-trace-tutor`를 만들고 [schema.sql](schema.sql)을 SQL Editor에서 한 번 실행합니다. **Project Settings → API Keys**에서 서버용 `sb_secret_...` 키, **Project Settings → Data API**에서 프로젝트 URL을 확인합니다. 데이터베이스는 서버에서만 접근하며, SQL은 익명·일반 역할의 테이블 접근을 차단합니다.
@@ -29,7 +31,7 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 
 새 앱의 **⋮ → Settings → Secrets**에 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)의 항목을 입력합니다. `redirect_uri`에는 **새 앱의 실제 주소** 뒤에 `/oauth2callback`을 붙인 값을 넣고, Google Cloud의 승인된 리디렉션 URI에도 똑같은 값을 추가합니다. `cookie_secret`은 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. Supabase URL·서버 키, **기존과 동일한** 암호화 키, Google 클라이언트 값이 모두 필요합니다. 특히 암호화 키를 바꾸면 기존에 저장된 개인 API 키를 읽을 수 없습니다. 문의 메일은 기본값 `be0128st@gmail.com`이며 Secrets의 `CONTACT_EMAIL`로 변경할 수 있습니다.
 
-배포 후 앱에서 Google 로그인을 누르고, 사이드바에 자신의 OpenAI API 키를 등록한 다음 예제 코드를 생성·풀이·새로고침해 보관함 복원을 확인합니다. **실제 API 키·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
+배포 후 화면 상단의 `앱 버전 2` 표시를 확인합니다. Google 로그인을 누르고, 사이드바에 자신의 OpenAI API 키를 등록한 다음 예제 코드를 생성·풀이·새로고침해 보관함 복원을 확인합니다. **실제 API 키·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
 
 Streamlit 인증 앱은 Community Cloud의 비공개 앱 한도에 포함됩니다. Google 로그인은 Streamlit이 처리하고, 사용자의 API 키는 암호화된 형태로 Supabase에 저장됩니다. Supabase 서버용 키와 암호화 키는 공개 저장소에 넣지 마세요.
 

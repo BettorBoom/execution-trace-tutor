@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet
 from streamlit.testing.v1 import AppTest
 from types import SimpleNamespace as Namespace
 
-from app import GeneratedTutorial, apply_record, open_hint, submit_answer
+from app import GeneratedTutorial, acknowledge_result, apply_record, open_hint, submit_answer
 from storage import (
     ArchiveStore,
     KeyUnavailable,
@@ -22,7 +22,7 @@ from storage import (
     google_owner,
     new_tutorial_record,
 )
-from test_app import SOURCE, generated_payload, payload
+from test_app import SOURCE, finish_generation, generated_payload, payload
 
 
 class FakeQuery:
@@ -204,6 +204,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(state["outcomes"][0]["wrong_count"], 1)
             self.assertTrue(submit_answer(state, "1"))
         self.assertEqual(state["current_step_idx"], 1)
+        self.assertTrue(state["awaiting_next"])
         self.assertEqual(state["outcomes"][0]["status"], "correct")
         self.assertEqual(state["active_version"], 3)
 
@@ -230,11 +231,14 @@ class StorageTests(unittest.TestCase):
             choice_key = f"choice_{first.session_state['generation_count']}_0_2"
             first.button(key=choice_key).click().run(timeout=15)
             self.assertEqual(first.session_state["current_step_idx"], 1)
+            self.assertTrue(first.session_state["awaiting_next"])
 
             second = AppTest.from_string("import app\napp.main()").run(timeout=15)
             next(button for button in second.button if button.label == "내 문제 보관함").click().run(timeout=15)
             second.button(key=f"open_{record['id']}").click().run(timeout=15)
             self.assertEqual(second.session_state["current_step_idx"], 1)
+            self.assertTrue(any("맞았습니다" in item.value for item in second.success))
+            second.button(key=f"next_{second.session_state['generation_count']}_0").click().run(timeout=15)
             self.assertTrue(any("모든 단계를 완료" in item.value for item in second.success))
             generate.assert_not_called()
 
@@ -248,6 +252,7 @@ class StorageTests(unittest.TestCase):
             page.text_area[1].set_value(SOURCE)
             self.client.fail_operation = "insert"
             page.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
+            finish_generation(page)
             self.assertIsNone(page.session_state["quiz_data"])
             self.assertIsNotNone(page.session_state["pending_generation"])
             self.assertEqual(client_class.return_value.responses.parse.call_count, 1)

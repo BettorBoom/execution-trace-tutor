@@ -45,6 +45,7 @@ def fresh_progress(steps: int) -> dict[str, Any]:
     return {
         "current_step_idx": 0,
         "hint_opened": False,
+        "awaiting_next": False,
         "outcomes": [{"status": "pending", "wrong_count": 0} for _ in range(steps)],
     }
 
@@ -56,10 +57,13 @@ def check_progress(progress: Any, steps: int) -> dict[str, Any]:
     index = progress.get("current_step_idx")
     outcomes = progress.get("outcomes")
     hint = progress.get("hint_opened")
+    awaiting_next = progress.get("awaiting_next", False)
     if (
         type(index) is not int
         or not 0 <= index <= steps
         or type(hint) is not bool
+        or type(awaiting_next) is not bool
+        or (awaiting_next and (index == 0 or hint))
         or not isinstance(outcomes, list)
         or len(outcomes) != steps
     ):
