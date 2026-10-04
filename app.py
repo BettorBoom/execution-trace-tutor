@@ -42,7 +42,7 @@ LANGUAGES = {"C": "c", "C++": "cpp", "Java": "java", "Python": "python"}
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_CONTACT_EMAIL = "be0128st@gmail.com"
 QUIZ_SCHEMA_VERSION = 2
-VERIFIED_SCHEMA_VERSION = 3
+VERIFIED_SCHEMA_VERSION = 4
 LOGGER = logging.getLogger("execution_trace_tutor")
 
 
@@ -322,6 +322,9 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
                 if (fact.get("source") != "probe" or fact.get("line_number") != step.line_number
                     or fact.get("target") != step.target or fact.get("after") != step.answer):
                     raise TutorialError("정답과 실행 관측값이 다릅니다.")
+                change = next(item for item in step.changes if item.target.strip() == step.target.strip())
+                if fact.get("before") != change.before or fact.get("after") != change.after:
+                    raise TutorialError("값 변화 설명과 실행 관측값이 다릅니다.")
             elif step.question_kind == "program_output":
                 if fact.get("source") != "stdout" or step.answer != display_output(tutorial.stdout):
                     raise TutorialError("정답과 실제 출력이 다릅니다.")
@@ -401,7 +404,16 @@ def build_verified_tutorial(
         before, after = str(event["before"]), str(event["after"])
         line_number, target = int(event["line_number"]), str(event["target"])
         occurrence = int(event["occurrence"])
-        context = f"{occurrence}번째 실행" if occurrence > 1 else ""
+        # 반복 변수 등 실제 관측한 실행 직전 조건을 질문에도 보여 준다.
+        conditions = [
+            f"{expression}={value}"
+            for expression, value in event.get("context_values", {}).items()
+            if expression != target and re.fullmatch(r"[A-Za-z_]\w*", expression)
+            and re.fullmatch(r"-?\d+", str(value))
+        ]
+        context = f"{occurrence}번째 실행"
+        if conditions:
+            context += " (실행 직전 " + ", ".join(conditions) + ")"
         change = StateChange(target=target, before=before, after=after, calculations=[])
         explanation = (
             f"{line_number}행의 {occurrence}번째 실행에서 `{target}`의 값이 "
@@ -413,12 +425,12 @@ def build_verified_tutorial(
             if re.fullmatch(r"-?\d+", str(value))
         ]
         if context_values:
-            explanation += " 계산에 쓰인 관측값: " + ", ".join(context_values) + "."
+            explanation += " 실행 직전에 확인한 계산값: " + ", ".join(context_values) + "."
         steps.append(TraceStep(
             line_number=line_number,
             question=question_for("value_after", line_number, target, context),
             choices=verified_choices(after, numeric=True), answer=after,
-            hint="대입식의 오른쪽과 실행 직전 값을 함께 살펴보세요.",
+            hint=f"실행 직전 `{target}`의 값은 {before}입니다. 대입식의 오른쪽을 계산해 보세요.",
             explanation=explanation, step_number=len(steps) + 1,
             code_line=lines[line_number - 1], question_kind="value_after",
             target=target, context=context, changes=[change],
@@ -917,7 +929,7 @@ def show_study_view() -> None:
         st.caption(f"값·정답이 맞지 않는 보조 문항 {quiz['excluded_steps']}개를 제외했습니다.")
     if quiz.get("schema_version", 1) < VERIFIED_SCHEMA_VERSION:
         st.warning(
-            "이 기록은 실제 코드 실행으로 검증하기 전에 만들었습니다. "
+            "이 기록은 이전 검증 방식으로 만들었습니다. "
             "정답이 틀릴 수 있어 채점을 중단했습니다. 원본으로 검증된 새 문제를 생성해 주세요."
         )
         st.code(st.session_state["study_source"], language=LANGUAGES[language], line_numbers=True)
@@ -1267,7 +1279,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 3 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:

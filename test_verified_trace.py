@@ -35,7 +35,7 @@ class VerifiedTraceTests(unittest.TestCase):
                 self.assertEqual([step.answer for step in tutorial.steps], ["3", "3"])
                 self.assertEqual(tutorial.steps[0].changes[0].before, "1")
                 self.assertEqual(tutorial.steps[0].verified_fact["after"], "3")
-                self.assertEqual(tutorial.schema_version, 3)
+                self.assertEqual(tutorial.schema_version, 4)
 
     @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
     def test_pointer_loop_calculation_is_measured(self):
@@ -50,11 +50,17 @@ class VerifiedTraceTests(unittest.TestCase):
         self.assertEqual(tutorial.steps[0].verified_fact["occurrence"], 3)
         self.assertEqual(tutorial.steps[0].verified_fact["context_values"]["i"], "2")
         self.assertEqual(tutorial.steps[0].verified_fact["context_values"]["*(*arr+i)+i"], "6")
+        self.assertIn("실행 직전 i=2", tutorial.steps[0].question)
         self.assertIn("`size` = 5", tutorial.steps[0].explanation)
         self.assertEqual(result["stdout"], "1")
 
         broken = tutorial.model_dump()
         broken["steps"][0]["answer"] = "0"
+        with self.assertRaises(TutorialError):
+            validate_tutorial(broken, "C", POINTER_SOURCE)
+
+        broken = tutorial.model_dump()
+        broken["steps"][0]["verified_fact"]["before"] = "99"
         with self.assertRaises(TutorialError):
             validate_tutorial(broken, "C", POINTER_SOURCE)
 

@@ -129,7 +129,7 @@ class TutorialTests(unittest.TestCase):
             request = client_class.return_value.responses.parse.call_args.kwargs
         self.assertEqual(tutorial.steps[0].answer, "1")
         self.assertIn("1", tutorial.steps[0].choices)
-        self.assertEqual(tutorial.schema_version, 3)
+        self.assertEqual(tutorial.schema_version, 4)
         self.assertTrue(tutorial.execution_verified)
         self.assertEqual([step.step_number for step in tutorial.steps], [1])
         self.assertEqual([step.code_line for step in tutorial.steps], ["int x = 1;"])
