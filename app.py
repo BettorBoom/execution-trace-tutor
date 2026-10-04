@@ -1290,7 +1290,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.1 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:
