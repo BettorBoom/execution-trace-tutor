@@ -163,8 +163,11 @@ question_kind: 값은 value_after, 이번 출력은 output_this_step, 누적 출
 질문 문장이나 번호를 생성하지 마세요. target에는 묻는 변수 또는 표현식만 적으세요.
 answer에는 실제 정답 값 하나만 적고, distractors에는 서로 다른 오답 정확히 2개를 적으세요.
 숫자를 묻는 문항의 오답도 숫자 형식이어야 합니다. 정답 또는 같은 뜻의 값은 오답에 넣지 마세요.
-value_after의 changes에는 target의 직전 값 before, 직후 값 after를 반드시 넣으세요.
-answer는 해당 after와 정확히 같아야 합니다. 그 외에 결과에 필요한 변수 변화도 포함하세요.
+value_after에서는 target을 첫 번째 changes 항목의 target과 글자까지 똑같이 적으세요.
+첫 번째 changes 항목에는 그 target의 직전 값 before, 직후 값 after를 넣고,
+answer를 첫 번째 after와 글자까지 똑같이 적으세요. 관련된 다른 변수 변화는 그 뒤에 적으세요.
+포인터의 주소 자체처럼 숫자로 확정할 수 없는 값은 묻지 말고 *p, arr[i] 등의 실제 값이나
+참조 관계의 효과를 물으세요.
 계산 근거가 단순 정수 +, -, *, 양수 %이면 calculations에 피연산자·결과를 순서대로 적으세요.
 예: arr[2]=(4+2)%5이면 (4,+,2,6), (6,%,5,1), after='1', answer='1'.
 지원하지 않는 연산의 calculations는 비워 두고 explanation에 언어 규칙과 계산을 설명하세요.
@@ -550,6 +553,15 @@ def generate_tutorial(
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 1)
         LOGGER.error("OpenAI 요청 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
         raise TutorialError(describe_api_error(exc), diagnostics) from None
+
+
+def run_generation_job(api_key: str, model: str, language: str, problem: str, source: str) -> dict[str, Any]:
+    """스레드에서 오류를 자료로 바꿔 Streamlit 재실행 뒤에도 정확한 사유를 보존한다."""
+    try:
+        tutorial = generate_tutorial(api_key, model, language, problem, source)
+    except TutorialError as exc:
+        return {"tutorial": None, "error": str(exc), "diagnostics": exc.diagnostics}
+    return {"tutorial": tutorial.model_dump(), "error": None, "diagnostics": None}
 
 
 def normalize_answer(answer: str) -> str:
@@ -1045,14 +1057,7 @@ def show_generation_status(store: ArchiveStore, owner: str) -> None:
         st.session_state["generation_job"] = None
         job["executor"].shutdown(wait=False)
         try:
-            tutorial = job["future"].result()
-        except TutorialError as exc:
-            st.session_state["generation_error"] = {
-                "message": str(exc),
-                "diagnostics": exc.diagnostics,
-                "elapsed_seconds": round(time.perf_counter() - job["started"], 1),
-            }
-            st.rerun()
+            result = job["future"].result()
         except Exception:
             LOGGER.error("생성 작업 처리 실패: %s", job["model"])
             st.session_state["generation_error"] = {
@@ -1062,8 +1067,15 @@ def show_generation_status(store: ArchiveStore, owner: str) -> None:
             }
             st.rerun()
         else:
+            if result["error"]:
+                st.session_state["generation_error"] = {
+                    "message": result["error"],
+                    "diagnostics": result["diagnostics"],
+                    "elapsed_seconds": round(time.perf_counter() - job["started"], 1),
+                }
+                st.rerun()
             record = new_tutorial_record(
-                job["problem"], job["language"], job["source"], job["model"], tutorial.model_dump()
+                job["problem"], job["language"], job["source"], job["model"], result["tutorial"]
             )
             st.session_state["pending_generation"] = record
             try:
@@ -1119,7 +1131,7 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
                 st.error(str(exc))
             else:
                 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-generation")
-                future = executor.submit(generate_tutorial, api_key, model.strip(), language, problem, source)
+                future = executor.submit(run_generation_job, api_key, model.strip(), language, problem, source)
                 st.session_state["generation_job"] = {
                     "future": future,
                     "executor": executor,
