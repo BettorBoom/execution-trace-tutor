@@ -10,28 +10,27 @@ from openai import AuthenticationError, BadRequestError, InternalServerError, Ra
 import httpx2
 
 from app import (
-    GeneratedTutorial,
     GenerationValidationError,
     TutorialError,
     acknowledge_result,
     advance_step,
     api_error_diagnostics,
     describe_api_error,
-    finalize_generated_tutorial,
     generate_tutorial,
     highlight_source,
     normalize_answer,
-    output_lines,
     parse_json_object,
     run_generation_job,
     submit_answer,
     validate_tutorial,
-    build_prompt,
     contact_html,
+    build_verified_tutorial,
 )
+from verified_trace import ProbePlan, validate_probe_plan
 
 
 SOURCE = "\nint x = 1;\nint x = 1;\n"
+VERIFIED_SETTINGS = {"MODAL_TOKEN_ID": "test-id", "MODAL_TOKEN_SECRET": "test-secret"}
 POINTER_SOURCE = """#include <stdio.h>
 void func(int** arr, int size){
     for(int i=0; i<size; i++){
@@ -68,24 +67,15 @@ def payload(language="C", steps=None, source=SOURCE):
     }
 
 
-def generated_payload(language="C", steps=None, source=SOURCE):
-    value = payload(language, steps, source)
-    generated_steps = []
-    for execution_number, step in enumerate(value["steps"], start=1):
-        generated_steps.append({
-            "line_number": step["line_number"],
-            "question_kind": "value_after",
-            "target": "x",
-            "context": f"main 실행 {execution_number}번째 시점",
-            "answer": step["answer"],
-            "distractors": [item for item in step["choices"] if item != step["answer"]][:2],
-            "hint": step["hint"],
-            "explanation": step["explanation"],
-            "changes": [{"target": "x", "before": "0", "after": step["answer"], "calculations": []}],
-        })
-    return {"language": language, "steps": generated_steps, "line_notes": [
-        {"line_number": min(2, len(source.split("\n"))), "note": "x의 실행 후 값은 1입니다."}
-    ]}
+def verified_payload(two_steps=False):
+    probes = [{"id": 0, "line_number": 2, "target": "x"}]
+    observations = [{"id": 0, "line_number": 2, "target": "x", "occurrence": 1,
+                     "before": "0", "after": "1", "event_index": 1}]
+    if two_steps:
+        probes.append({"id": 1, "line_number": 3, "target": "x"})
+        observations.append({"id": 1, "line_number": 3, "target": "x", "occurrence": 1,
+                             "before": "1", "after": "2", "event_index": 2})
+    return build_verified_tutorial("C", SOURCE, probes, observations, "").model_dump()
 
 
 def finish_generation(page):
@@ -126,42 +116,43 @@ class TutorialTests(unittest.TestCase):
 
     def test_openai_structured_response(self):
         response = SimpleNamespace(
-            output_parsed=GeneratedTutorial.model_validate(
-                generated_payload(steps=[STEP.copy(), {**STEP, "step_number": 8}])
-            ),
+            output_parsed=ProbePlan.model_validate({"probes": [
+                {"line_number": 2, "target": "x", "reason": "값 변화"}
+            ]}),
             status="completed",
         )
-        with patch("app.OpenAI") as client_class:
+        observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
+            "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
+        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed) as sandbox:
             client_class.return_value.responses.parse.return_value = response
-            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
+            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
             request = client_class.return_value.responses.parse.call_args.kwargs
         self.assertEqual(tutorial.steps[0].answer, "1")
         self.assertIn("1", tutorial.steps[0].choices)
-        self.assertEqual(tutorial.schema_version, 2)
-        self.assertEqual([step.step_number for step in tutorial.steps], [1, 2])
-        self.assertEqual([step.code_line for step in tutorial.steps], ["int x = 1;", "int x = 1;"])
+        self.assertEqual(tutorial.schema_version, 3)
+        self.assertTrue(tutorial.execution_verified)
+        self.assertEqual([step.step_number for step in tutorial.steps], [1])
+        self.assertEqual([step.code_line for step in tutorial.steps], ["int x = 1;"])
         self.assertEqual(request["model"], "gpt-4.1-mini")
-        self.assertIs(request["text_format"], GeneratedTutorial)
+        self.assertIs(request["text_format"], ProbePlan)
         self.assertFalse(request["store"])
         self.assertEqual(client_class.call_args.kwargs["timeout"], 60.0)
         self.assertEqual(client_class.call_args.kwargs["max_retries"], 0)
+        sandbox.assert_called_once()
 
     def test_openai_schema_avoids_unsupported_array_limits(self):
-        schema = json.dumps(GeneratedTutorial.model_json_schema())
+        schema = json.dumps(ProbePlan.model_json_schema())
         self.assertNotIn('"minItems"', schema)
         self.assertNotIn('"maxItems"', schema)
 
-    def test_malformed_json_retries_without_losing_valid_result(self):
+    def test_malformed_json_fails_before_sandbox(self):
         malformed = SimpleNamespace(output_parsed=None, status="completed", output_text="{broken")
-        valid = SimpleNamespace(
-            output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
-        )
-        with patch("app.OpenAI") as client_class:
-            client_class.return_value.responses.parse.side_effect = [malformed, valid]
-            with self.assertLogs("execution_trace_tutor", level="WARNING"):
-                tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
-        self.assertEqual(tutorial.steps[0].answer, "1")
-        self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace") as sandbox:
+            client_class.return_value.responses.parse.return_value = malformed
+            with self.assertRaises(TutorialError):
+                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
+        sandbox.assert_not_called()
+        self.assertEqual(client_class.return_value.responses.parse.call_count, 1)
 
     def test_background_job_returns_serializable_diagnostics(self):
         with patch("app.generate_tutorial", side_effect=GenerationValidationError(2, "값이 다름")):
@@ -170,226 +161,27 @@ class TutorialTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"], {"step_number": 2, "reason": "값이 다름"})
         self.assertNotIn("test-key", json.dumps(result, ensure_ascii=False))
 
-    def test_generated_line_number_still_validated(self):
-        with self.assertRaises(TutorialError):
-            finalize_generated_tutorial(
-                generated_payload(steps=[{**STEP, "line_number": 99}]), "C", SOURCE
-            )
-
-    def test_seven_question_limit_and_selection_prompt(self):
-        seven = generated_payload(steps=[STEP.copy() for _ in range(7)])
-        self.assertEqual(len(finalize_generated_tutorial(seven, "C", SOURCE).steps), 7)
-        with self.assertRaises(TutorialError):
-            finalize_generated_tutorial(generated_payload(steps=[STEP.copy() for _ in range(8)]), "C", SOURCE)
-        prompt = build_prompt("C", "출력은?", SOURCE)
-        self.assertIn("1~7개", prompt)
-        self.assertIn("단순 상수 초기화", prompt)
-        self.assertIn("이번 출력", prompt)
-        self.assertIn("distractors", prompt)
-
-    def test_answer_and_choices_have_one_source(self):
-        generated = generated_payload()
-        generated["steps"][0]["distractors"] = ["0", "2"]
-        tutorial = finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(tutorial.steps[0].answer, "1")
-        self.assertEqual(set(tutorial.steps[0].choices), {"0", "1", "2"})
-
-    def test_invalid_choices_retry_only_once(self):
-        duplicate = generated_payload()
-        duplicate["steps"][0]["distractors"] = ["1", "2"]
-        invalid_response = SimpleNamespace(
-            output_parsed=GeneratedTutorial.model_validate(duplicate), status="completed"
-        )
-        valid_response = SimpleNamespace(
-            output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
-        )
-        retry_notice = MagicMock()
-        with patch("app.OpenAI") as client_class:
-            client_class.return_value.responses.parse.side_effect = [invalid_response, valid_response]
-            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, retry_notice)
-            self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
-        self.assertEqual(tutorial.steps[0].answer, "1")
-        retry_notice.assert_called_once_with()
-
-        with patch("app.OpenAI") as client_class:
-            client_class.return_value.responses.parse.return_value = invalid_response
-            with self.assertLogs("execution_trace_tutor", level="WARNING") as logs:
-                with self.assertRaises(TutorialError) as raised:
-                    generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
-            self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
-        self.assertEqual(len(logs.output), 2)
-        self.assertIn('"attempt": 1', logs.output[0])
-        self.assertIn('"attempt": 2', logs.output[1])
-        self.assertNotIn("test-key", " ".join(logs.output))
-        self.assertEqual(raised.exception.diagnostics["step_number"], 1)
-        self.assertEqual(raised.exception.diagnostics["reason"], "중복 선택지 있음")
-        self.assertEqual(raised.exception.diagnostics["retry_count"], 1)
-
-    def test_empty_or_missing_choice_is_retryable(self):
-        for choices, reason in (
-            (["0", " "], "빈 선택지 있음"),
-            (["0"], "오답 후보 개수가 2개가 아님"),
-        ):
-            with self.subTest(choices=choices):
-                generated = generated_payload()
-                generated["steps"][0]["distractors"] = choices
-                with self.assertRaises(TutorialError) as raised:
-                    finalize_generated_tutorial(generated, "C", SOURCE)
-                self.assertEqual(raised.exception.diagnostics["reason"], reason)
-
-    def test_answer_must_match_value_and_arithmetic(self):
-        generated = generated_payload()
-        generated["steps"][0]["answer"] = "2"
-        with self.assertRaises(TutorialError) as raised:
-            finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(raised.exception.diagnostics["reason"], "정답과 모든 실행 후 값이 다름")
-
-    def test_value_question_uses_matching_state_target(self):
-        generated = generated_payload()
-        generated["steps"][0]["target"] = "x의 값"
-        result = finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(result.steps[0].target, "x")
-        self.assertIn("`x`의 값", result.steps[0].question)
-
-    def test_numeric_aliases_and_repeated_questions_are_rejected(self):
-        generated = generated_payload()
-        generated["steps"][0]["distractors"] = ["01", "2"]
-        with self.assertRaises(TutorialError) as raised:
-            finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(raised.exception.diagnostics["reason"], "중복 선택지 있음")
-
-        generated["steps"][0]["distractors"] = ["잘 모르겠음", "2"]
-        with self.assertRaises(TutorialError) as raised:
-            finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(raised.exception.diagnostics["reason"], "숫자 질문에 숫자가 아닌 선택지 있음")
-
-        generated = generated_payload(steps=[STEP.copy(), STEP.copy()])
-        generated["steps"][1]["context"] = generated["steps"][0]["context"]
-        with self.assertRaises(TutorialError) as raised:
-            finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(raised.exception.diagnostics["reason"], "같은 시점의 질문이 중복됨")
-
-    def test_other_languages_keep_original_lines_and_value_notes(self):
-        samples = [
-            ("C++", "int main(){\n int x=3;\n int* p=&x;\n *p=5;\n}", 4, "x", "3", "5"),
-            ("Java", "class A {\n public static void main(String[] a){\n int[] xs={1,2};\n xs[1]=4;\n }\n}", 4, "xs[1]", "2", "4"),
-            ("Python", "xs = [1, 2, 3]\nxs[1] = 4", 2, "xs[1]", "2", "4"),
-        ]
-        for language, source, line_number, target, before, after in samples:
-            with self.subTest(language=language):
-                generated = {
-                    "language": language,
-                    "steps": [{
-                        "line_number": line_number, "question_kind": "value_after",
-                        "target": target, "context": "대입 직후", "answer": after,
-                        "distractors": [before, "9"], "hint": "대입식을 확인하세요.",
-                        "explanation": f"{target}는 {before}에서 {after}로 바뀝니다.",
-                        "changes": [{"target": target, "before": before, "after": after, "calculations": []}],
-                    }],
-                    "line_notes": [{"line_number": line_number, "note": f"{target}가 {before}에서 {after}로 변경됩니다."}],
-                }
-                tutorial = finalize_generated_tutorial(generated, language, source)
-                self.assertEqual(tutorial.steps[0].code_line, source.split("\n")[line_number - 1])
-                self.assertIn(f"{before} → {after}", tutorial.annotated_code)
-                self.assertEqual(validate_tutorial(tutorial.model_dump(), language, source), tutorial)
-
-    def test_pointer_example_rejects_missing_correct_choice(self):
-        generated = {
-            "language": "C",
-            "steps": [{
-                "line_number": 13, "question_kind": "value_after", "target": "num",
-                "context": "func(pp, 5) 실행을 마친 뒤", "answer": "1",
-                "distractors": ["0", "4"], "hint": "arr[2]의 새 값을 확인하세요.",
-                "explanation": "i=2일 때 arr[2]=(4+2)%5=1이고 num은 6에서 1이 됩니다.",
-                "changes": [{
-                    "target": "num", "before": "6", "after": "1",
-                    "calculations": [
-                        {"left": 4, "operator": "+", "right": 2, "result": 6},
-                        {"left": 6, "operator": "%", "right": 5, "result": 1},
-                    ],
-                }],
-            }],
-            "line_notes": [{
-                "line_number": 4,
-                "note": "i=0..4: arr 값이 [3,1,4,1,5]에서 [3,2,1,4,4]로 바뀝니다.",
-            }],
-        }
-        result = finalize_generated_tutorial(generated, "C", POINTER_SOURCE)
-        self.assertEqual(result.steps[0].answer, "1")
-        self.assertEqual(set(result.steps[0].choices), {"0", "1", "4"})
-        self.assertIn("num 6 → 1", result.annotated_code)
-        self.assertIn("[3,2,1,4,4]", result.annotated_code)
-        self.assertIn("num", result.steps[0].question)
-
-        wrong = json.loads(json.dumps(generated))
-        wrong["steps"][0]["answer"] = "2"
-        with self.assertRaises(TutorialError):
-            finalize_generated_tutorial(wrong, "C", POINTER_SOURCE)
-        wrong["steps"][0]["answer"] = "1"
-        wrong["steps"][0]["changes"][0]["calculations"][1]["result"] = 2
-        with self.assertRaises(TutorialError):
-            finalize_generated_tutorial(wrong, "C", POINTER_SOURCE)
-
-        app = self.study_app()
-        app.session_state["quiz_data"] = result.model_dump()
-        app.session_state["study_language"] = "C"
-        app.session_state["study_source"] = POINTER_SOURCE
-        app.session_state["study_problem"] = "출력값은?"
-        app.session_state["current_step_idx"] = 1
-        app.session_state["awaiting_next"] = True
-        app.session_state["outcomes"] = [{"status": "correct", "wrong_count": 0}]
-        app.run(timeout=15)
-        self.assertTrue(any("맞았습니다" in item.value for item in app.success))
-        self.assertTrue(any("6 → 1" in item.value for item in app.markdown))
-        self.assertTrue(any(button.label == "학습 마치기" for button in app.button))
-
-    def test_output_problem_requires_output_question(self):
-        self.assertEqual(output_lines(POINTER_SOURCE, "C"), {14})
-        self.assertEqual(output_lines("#print(0)\nprint(1)", "Python"), {2})
-        self.assertEqual(output_lines("std::cout << x;", "C++"), {1})
-        self.assertEqual(output_lines("System.out.println(x);", "Java"), {1})
-
-        generated = {
-            "language": "C", "steps": [{
-                "line_number": 13, "question_kind": "value_after", "target": "num",
-                "context": "함수 호출 후", "answer": "1", "distractors": ["0", "4"],
-                "hint": "배열의 세 번째 값을 살펴보세요.",
-                "explanation": "num은 6에서 1로 바뀝니다.",
-                "changes": [{"target": "num", "before": "6", "after": "1", "calculations": []}],
-            }],
-            "line_notes": [{"line_number": 4, "note": "i=2에서 arr[2]는 4에서 1이 됩니다."}],
-        }
-        with self.assertRaises(GenerationValidationError) as raised:
-            finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
-        self.assertIn("출력", raised.exception.diagnostics["reason"])
-
-        generated["steps"].append({
-            "line_number": 14, "question_kind": "output_this_step", "target": "printf(\"%d\", num)",
-            "context": "num에 arr[2]를 넣은 뒤", "answer": "1", "distractors": ["0", "4"],
-            "hint": "printf가 받는 num의 값을 확인하세요.",
-            "explanation": "arr[2]가 1이므로 printf는 1을 출력합니다.", "changes": [],
-        })
-        result = finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
-        self.assertEqual(result.steps[-1].line_number, 14)
-        self.assertEqual(result.steps[-1].answer, "1")
-
-        generated["steps"][0]["answer"] = "2"
-        with self.assertLogs("execution_trace_tutor", level="WARNING"):
-            filtered = finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
-        self.assertEqual(len(filtered.steps), 1)
-        self.assertEqual(filtered.steps[0].step_number, 1)
-        self.assertEqual(filtered.steps[0].question_kind, "output_this_step")
-        self.assertEqual(filtered.excluded_steps, 1)
+    def test_invalid_probe_is_dropped_without_model_answer(self):
+        plan = ProbePlan.model_validate({"probes": [
+            {"line_number": 2, "target": "danger()", "reason": "잘못된 제안"},
+            {"line_number": 3, "target": "x", "reason": "값 변화"},
+        ]})
+        self.assertEqual(validate_probe_plan(plan, SOURCE, "C"), [
+            {"id": 0, "line_number": 3, "target": "x", "context_exprs": []},
+        ])
 
     def test_raw_json_fallback_builds_step_numbers(self):
+        plan = {"probes": [{"line_number": 2, "target": "x", "reason": "값 변화"}]}
         response = SimpleNamespace(
             output_parsed=None,
             status="completed",
-            output_text=f"```json\n{json.dumps(generated_payload(), ensure_ascii=False)}\n```",
+            output_text=f"```json\n{json.dumps(plan, ensure_ascii=False)}\n```",
         )
-        with patch("app.OpenAI") as client_class:
+        observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
+            "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
+        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed):
             client_class.return_value.responses.parse.return_value = response
-            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
+            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
         self.assertEqual(tutorial.steps[0].step_number, 1)
         self.assertEqual(tutorial.steps[0].code_line, "int x = 1;")
 
@@ -494,11 +286,7 @@ class TutorialTests(unittest.TestCase):
 
     def test_streamlit_hint_and_completion(self):
         app = self.study_app()
-        app.session_state["quiz_data"] = {
-            "language": "C",
-            "steps": [STEP.copy()],
-            "annotated_code": SOURCE + "// 복습",
-        }
+        app.session_state["quiz_data"] = verified_payload()
         app.session_state["study_language"] = "C"
         app.session_state["study_source"] = SOURCE
         app.session_state["study_problem"] = "x의 값"
@@ -506,7 +294,10 @@ class TutorialTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(len([button for button in app.button if (button.key or "").startswith("choice_")]), 3)
         self.assertEqual(len([button for button in app.button if "Pass" in button.label]), 0)
-        app.button(key="choice_0_0_1").click().run()
+        answer = app.session_state["quiz_data"]["steps"][0]["answer"]
+        choices = app.session_state["quiz_data"]["steps"][0]["choices"]
+        wrong = next(i for i, choice in enumerate(choices, 1) if choice != answer)
+        app.button(key=f"choice_0_0_{wrong}").click().run()
         self.assertEqual(app.session_state["current_step_idx"], 0)
         self.assertTrue(any("정답" in item.value for item in app.warning))
         app.button(key="hint_0_0").click().run()
@@ -520,16 +311,13 @@ class TutorialTests(unittest.TestCase):
 
     def test_streamlit_correct_choice_advances(self):
         app = self.study_app()
-        app.session_state["quiz_data"] = {
-            "language": "C",
-            "steps": [STEP.copy()],
-            "annotated_code": SOURCE + "// 복습",
-        }
+        app.session_state["quiz_data"] = verified_payload()
         app.session_state["study_language"] = "C"
         app.session_state["study_source"] = SOURCE
         app.session_state["study_problem"] = "x의 값"
         app.run()
-        app.button(key="choice_0_0_2").click().run()
+        correct = app.session_state["quiz_data"]["steps"][0]["choices"].index("1") + 1
+        app.button(key=f"choice_0_0_{correct}").click().run()
         self.assertEqual(app.session_state["current_step_idx"], 1)
         self.assertTrue(app.session_state["awaiting_next"])
         self.assertTrue(any("맞았습니다" in item.value for item in app.success))
@@ -539,11 +327,7 @@ class TutorialTests(unittest.TestCase):
 
     def test_repeated_line_does_not_claim_total_executions(self):
         app = self.study_app()
-        app.session_state["quiz_data"] = {
-            "language": "C",
-            "steps": [STEP.copy(), {**STEP, "step_number": 2, "answer": "2"}],
-            "annotated_code": SOURCE + "// 복습",
-        }
+        app.session_state["quiz_data"] = verified_payload(two_steps=True)
         app.session_state["study_language"] = "C"
         app.session_state["study_source"] = SOURCE
         app.session_state["study_problem"] = "반복 실행"
@@ -554,17 +338,13 @@ class TutorialTests(unittest.TestCase):
         app.run()
         self.assertEqual(len(app.exception), 0)
         self.assertFalse(any("총 2회 중 2번째 실행" in item.value for item in app.markdown))
-        self.assertTrue(any("현재 2행" in item.value for item in app.markdown))
+        self.assertTrue(any("현재 3행" in item.value for item in app.markdown))
         self.assertTrue(any("지난 단계 다시 보기" in item.label for item in app.expander))
         self.assertEqual(list(app.dataframe[0].value["정답"]), ["1"])
 
     def test_completed_questions_remain_available_for_review(self):
         app = self.study_app()
-        app.session_state["quiz_data"] = {
-            "language": "C",
-            "steps": [STEP.copy(), {**STEP, "step_number": 2, "answer": "2"}],
-            "annotated_code": SOURCE + "// 복습",
-        }
+        app.session_state["quiz_data"] = verified_payload(two_steps=True)
         app.session_state["study_language"] = "C"
         app.session_state["study_source"] = SOURCE
         app.session_state["study_problem"] = "반복 실행"
@@ -577,13 +357,19 @@ class TutorialTests(unittest.TestCase):
 
     def test_generation_failure_preserves_study(self):
         store = self.fake_store()
-        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+        observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
+            "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store), \
+             patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")), \
+             patch("app.run_isolated_trace", return_value=observed):
             app = AppTest.from_string("import app\napp.main()").run(timeout=15)
             app.text_area[0].set_value("x의 값은?")
             app.text_area[1].set_value(SOURCE)
             with patch("app.OpenAI") as client_class:
                 client_class.return_value.responses.parse.return_value = SimpleNamespace(
-                    output_parsed=GeneratedTutorial.model_validate(generated_payload()), status="completed"
+                    output_parsed=ProbePlan.model_validate({"probes": [
+                        {"line_number": 2, "target": "x", "reason": "값 변화"}
+                    ]}), status="completed"
                 )
                 app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
                 finish_generation(app)
@@ -604,7 +390,8 @@ class TutorialTests(unittest.TestCase):
     def test_streamlit_api_error_details_hide_key(self):
         store = self.fake_store()
         store.get_key.return_value = "secret-key"
-        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store), \
+             patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")):
             app = AppTest.from_string("import app\napp.main()").run(timeout=15)
             app.text_area[0].set_value("x의 값은?")
             app.text_area[1].set_value(SOURCE)
@@ -625,14 +412,11 @@ class TutorialTests(unittest.TestCase):
         self.assertEqual(json.loads(app.json[0].value)["api_status"], "rate_limit_exceeded")
         self.assertNotIn("secret-key", app.json[0].value)
 
-    def test_streamlit_choice_error_shows_reason(self):
+    def test_streamlit_malformed_plan_never_creates_quiz(self):
         store = self.fake_store()
-        generated = generated_payload()
-        generated["steps"][0]["distractors"] = ["1", "2"]
-        invalid = SimpleNamespace(
-            output_parsed=GeneratedTutorial.model_validate(generated), status="completed"
-        )
-        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store):
+        invalid = SimpleNamespace(output_parsed=None, status="completed", output_text="{broken")
+        with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store), \
+             patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")):
             app = AppTest.from_string("import app\napp.main()").run(timeout=15)
             app.text_area[0].set_value("x의 값은?")
             app.text_area[1].set_value(SOURCE)
@@ -640,10 +424,8 @@ class TutorialTests(unittest.TestCase):
                 client_class.return_value.responses.parse.return_value = invalid
                 app.button(key="FormSubmitter:generate_form-핵심 문제 생성").click().run(timeout=15)
                 finish_generation(app)
-                self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
-        self.assertTrue(any("1번 문항" in item.value for item in app.error))
-        self.assertTrue(any("생성 오류 상세" in item.label for item in app.expander))
-        self.assertEqual(json.loads(app.json[0].value)["reason"], "중복 선택지 있음")
+                self.assertEqual(client_class.return_value.responses.parse.call_count, 1)
+        self.assertTrue(any("JSON" in item.value for item in app.error))
         self.assertIsNone(app.session_state["quiz_data"])
 
     def test_contact_links_are_encoded(self):

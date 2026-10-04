@@ -1,4 +1,4 @@
-"""OpenAI가 만든 질문으로 코드 실행 흐름을 학습하는 Streamlit 앱."""
+"""격리 실행으로 확인한 값으로 코드 흐름을 학습하는 Streamlit 앱."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from html import escape
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 import streamlit as st
@@ -21,6 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
+from verified_trace import (
+    MAX_SOURCE_BYTES, ProbePlan, TraceError, plan_prompt, run_isolated_trace,
+    validate_probe_plan,
+)
 
 from storage import (
     ArchiveStore,
@@ -38,6 +42,7 @@ LANGUAGES = {"C": "c", "C++": "cpp", "Java": "java", "Python": "python"}
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_CONTACT_EMAIL = "be0128st@gmail.com"
 QUIZ_SCHEMA_VERSION = 2
+VERIFIED_SCHEMA_VERSION = 3
 LOGGER = logging.getLogger("execution_trace_tutor")
 
 
@@ -66,20 +71,6 @@ class LineNote(BaseModel):
     note: str
 
 
-class GeneratedTraceStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    line_number: int
-    question_kind: Literal["value_after", "output_this_step", "output_so_far", "diagnostic"]
-    target: str
-    context: str
-    answer: str
-    distractors: list[str]
-    hint: str
-    explanation: str
-    changes: list[StateChange]
-
-
 class TraceStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,15 +86,7 @@ class TraceStep(BaseModel):
     target: str = ""
     context: str = ""
     changes: list[StateChange] = Field(default_factory=list)
-
-
-class GeneratedTutorial(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    language: str
-    # OpenAI의 엄격한 JSON Schema에서 배열 길이 제약이 400을 유발할 수 있어 앱에서 검사한다.
-    steps: list[GeneratedTraceStep]
-    line_notes: list[LineNote]
+    verified_fact: dict[str, Any] | None = None
 
 
 class Tutorial(BaseModel):
@@ -115,6 +98,8 @@ class Tutorial(BaseModel):
     schema_version: int = 1
     line_notes: list[LineNote] = Field(default_factory=list)
     excluded_steps: int = 0
+    execution_verified: bool = False
+    stdout: str = ""
 
 
 class TutorialError(Exception):
@@ -139,51 +124,6 @@ class GenerationValidationError(TutorialError):
 
 
 ChoiceValidationError = GenerationValidationError
-
-
-def build_prompt(language: str, problem: str, source: str) -> str:
-    """정답과 수치 근거를 한 번만 생성하고 화면 문장은 앱이 구성한다."""
-    numbered_source = "\n".join(
-        f"{number}: {line}" for number, line in enumerate(source.split("\n"), start=1)
-    )
-    return f"""당신은 초보자에게 코드 실행을 설명하는 한국어 튜터입니다.
-선택 언어: {language}
-문제 설명: {problem}
-
-아래 원본 소스의 전체 실행을 분석하세요. 실행했다고 주장하지 말고 언어 규칙에 따라 계산하세요.
-실제 실행 순서에서 학습 가치가 높은 지점만 1~7개 고르세요. 짧은 코드는 억지로 채우지 마세요.
-최종 출력·문제에서 요구한 결과·오류 원인, 포인터/참조/배열/슬라이싱, 함수 부수 효과와
-반복문의 핵심 값 변화를 우선하세요. 단순 상수 초기화와 같은 의미의 반복 질문은 피하세요.
-문제가 출력값을 요구하고 코드에 출력문이 있으면, 마지막 출력문 또는 그 결과를 확정할 수
-없는 오류 지점을 반드시 문항으로 포함하세요. 출력값 문항의 line_number는 실제 출력문 행입니다.
-질문하지 않는 줄과 반복 회차도 실행한 것으로 계산하세요. 같은 줄의 반복 출제는 context에
-반복 변수와 이번 회차를 명시하세요. context와 hint에 정답 값을 미리 쓰지 마세요.
-line_number는 아래 1-based 물리적 줄 번호이며 steps는 실제 실행 순서입니다.
-빈 줄·주석·단독 중괄호는 문항으로 만들지 마세요.
-
-question_kind: 값은 value_after, 이번 출력은 output_this_step, 누적 출력은 output_so_far,
-입력 미지정/정의되지 않은 동작/실행 오류는 diagnostic입니다. 앱이 질문 문장을 만드므로
-질문 문장이나 번호를 생성하지 마세요. target에는 묻는 변수 또는 표현식만 적으세요.
-answer에는 실제 정답 값 하나만 적고, distractors에는 서로 다른 오답 정확히 2개를 적으세요.
-숫자를 묻는 문항의 오답도 숫자 형식이어야 합니다. 정답 또는 같은 뜻의 값은 오답에 넣지 마세요.
-value_after에서는 target을 첫 번째 changes 항목의 target과 글자까지 똑같이 적으세요.
-첫 번째 changes 항목에는 그 target의 직전 값 before, 직후 값 after를 넣고,
-answer를 첫 번째 after와 글자까지 똑같이 적으세요. 관련된 다른 변수 변화는 그 뒤에 적으세요.
-포인터의 주소 자체처럼 숫자로 확정할 수 없는 값은 묻지 말고 *p, arr[i] 등의 실제 값이나
-참조 관계의 효과를 물으세요.
-계산 근거가 단순 정수 +, -, *, 양수 %이면 calculations에 피연산자·결과를 순서대로 적으세요.
-예: arr[2]=(4+2)%5이면 (4,+,2,6), (6,%,5,1), after='1', answer='1'.
-지원하지 않는 연산의 calculations는 비워 두고 explanation에 언어 규칙과 계산을 설명하세요.
-explanation은 초보자가 숫자를 따라갈 수 있게 직전 값→연산→직후 값을 구체적으로 적으세요.
-hint는 정답을 직접 밝히지 않는 단서로 작성하세요.
-line_notes에는 출제하지 않은 핵심 실행 행과 반복문의 대표·마지막 회차를 행 번호·값 변화로
-설명하세요. 메모는 최대 20개로 요약하고, 반복이 길면 모든 회차를 나열하지 마세요.
-중괄호 자체나 단순 선언에는 메모를 억지로 만들지 마세요. 원본 코드를 다시 출력하지 마세요.
-C/C++ 포인터·정수 규칙, Java 참조·배열, Python LEGB·가변 객체·슬라이싱 중 실제 코드에
-필요한 규칙을 적용하세요. 모든 설명과 메모는 간단하고 쉬운 한국어로 작성하세요.
-
-원본 소스 (번호는 설명용이며 코드에 포함되지 않음):
-{numbered_source}"""
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -261,6 +201,8 @@ def question_for(kind: str, line_number: int, target: str, context: str) -> str:
         return f"{prefix}{line_number}행의 `{target}`가 이번에 출력하는 내용은 무엇인가요?"
     if kind == "output_so_far":
         return f"{prefix}{line_number}행의 `{target}` 실행 직후까지 누적된 출력은 무엇인가요?"
+    if kind == "program_output":
+        return "이 프로그램이 정상 종료할 때의 최종 표준 출력은 무엇인가요?"
     return f"{prefix}{line_number}행의 `{target}` 결과를 확정할 수 없는 이유는 무엇인가요?"
 
 
@@ -297,10 +239,19 @@ def review_code(source: str, language: str, notes: list[LineNote], steps: list[T
     all_notes = [(item.line_number, item.note) for item in notes]
     for step in steps:
         for change in step.changes:
+            detail = f"{step.context}: {change.target} {change.before} → {change.after}"
+            if step.verified_fact:
+                context_values = step.verified_fact.get("context_values", {})
+                if context_values:
+                    detail += "; " + ", ".join(
+                        f"{expression}={value}" for expression, value in context_values.items()
+                    )
             all_notes.append((
                 step.line_number,
-                f"{step.context}: {change.target} {change.before} → {change.after}",
+                detail,
             ))
+        if step.question_kind == "program_output" and step.verified_fact:
+            all_notes.append((step.line_number, f"검증된 최종 표준 출력: {step.answer}"))
     comments = [
         f"{marker} {line_number}행: {note.replace(chr(10), ' ').replace(chr(13), ' ')}"
         for line_number, note in all_notes
@@ -362,6 +313,20 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
                 raise TutorialError("행별 주석의 위치나 설명이 올바르지 않습니다. 다시 생성해 주세요.")
         if tutorial.annotated_code != review_code(source, language, tutorial.line_notes, tutorial.steps):
             raise TutorialError("저장된 주석 코드가 원본 실행 정보와 다릅니다.")
+    if tutorial.schema_version >= VERIFIED_SCHEMA_VERSION:
+        if not tutorial.execution_verified:
+            raise TutorialError("실행 검증 정보가 없는 문제는 채점할 수 없습니다.")
+        for step in tutorial.steps:
+            fact = step.verified_fact or {}
+            if step.question_kind == "value_after":
+                if (fact.get("source") != "probe" or fact.get("line_number") != step.line_number
+                    or fact.get("target") != step.target or fact.get("after") != step.answer):
+                    raise TutorialError("정답과 실행 관측값이 다릅니다.")
+            elif step.question_kind == "program_output":
+                if fact.get("source") != "stdout" or step.answer != display_output(tutorial.stdout):
+                    raise TutorialError("정답과 실제 출력이 다릅니다.")
+            else:
+                raise TutorialError("실행으로 확인되지 않은 문항 종류입니다.")
     return tutorial
 
 
@@ -380,110 +345,113 @@ def output_lines(source: str, language: str) -> set[int]:
     }
 
 
-def build_trace_step(step: GeneratedTraceStep, lines: list[str], number: int) -> TraceStep:
-    """한 문항의 정답·상태·선택지를 대조하고 실제 질문 대상을 확정한다."""
-    if not 1 <= step.line_number <= len(lines):
-        raise GenerationValidationError(number, "줄 번호가 원본 코드 밖에 있음")
-    if not all(value.strip() for value in (step.target, step.answer, step.hint, step.explanation)):
-        raise GenerationValidationError(number, "질문 맥락·정답·설명에 빈 값이 있음")
-    target = step.target.strip()
-    if step.question_kind == "value_after":
-        matching = [
-            change for change in step.changes
-            if normalize_answer(change.after) == normalize_answer(step.answer)
-        ]
-        if not matching:
-            raise GenerationValidationError(number, "정답과 모든 실행 후 값이 다름")
-        # 모델의 자유 형식 target보다, 같은 정답을 가진 구조화된 값 변화의 대상을 사용한다.
-        selected = next((change for change in matching if change.target.strip() == target), matching[0])
-        target = selected.target.strip()
-        if (
-            selected.before.lstrip("-").isdigit()
-            and selected.after.lstrip("-").isdigit()
-            and selected.before != selected.after
-            and (selected.before not in step.explanation or selected.after not in step.explanation)
-        ):
-            raise GenerationValidationError(number, "해설에 값 변화가 빠짐")
-    check_calculations(step.changes, number)
-    if len(step.distractors) != 2:
-        raise ChoiceValidationError(number, "오답 후보 개수가 2개가 아님")
-    choices = [step.answer, *step.distractors]
-    check_choices(choices, number, step.answer, step.question_kind)
-    random.SystemRandom().shuffle(choices)
-    return TraceStep(
-        line_number=step.line_number,
-        question=question_for(step.question_kind, step.line_number, target, step.context),
-        choices=choices,
-        answer=step.answer,
-        hint=step.hint,
-        explanation=step.explanation,
-        step_number=number,
-        code_line=lines[step.line_number - 1],
-        question_kind=step.question_kind,
-        target=target,
-        context=step.context,
-        changes=step.changes,
-    )
+def display_output(stdout: str) -> str:
+    """터미널의 관례적인 마지막 개행만 화면에서 생략한다."""
+    if stdout.endswith("\n") and stdout.count("\n") == 1 and stdout[:-1].strip() == stdout[:-1]:
+        return stdout[:-1]
+    if stdout and "\n" not in stdout and stdout.strip() == stdout:
+        return stdout
+    return json.dumps(stdout, ensure_ascii=False)
 
 
-def finalize_generated_tutorial(
-    payload: dict[str, Any], language: str, source: str, problem: str = ""
-) -> Tutorial:
-    """모델이 판단한 줄 번호를 검증하고, 순서와 원문은 앱에서 확정한다."""
-    if isinstance(payload.get("steps"), list) and not 1 <= len(payload["steps"]) <= 7:
-        raise GenerationValidationError(0, "문항 수가 1~7개가 아님")
-    try:
-        generated = GeneratedTutorial.model_validate(payload)
-    except ValidationError as exc:
-        raise GenerationValidationError(0, "필수 단계 정보 또는 자료형이 올바르지 않음") from exc
-    lines = source.split("\n")
-    if len(generated.line_notes) > 20:
-        raise GenerationValidationError(0, "행별 메모가 20개를 초과함")
-    if sum(bool(line.strip()) for line in lines) > 4 and not generated.line_notes:
-        raise GenerationValidationError(1, "핵심 행별 메모가 없음")
-    steps = []
-    prints = output_lines(source, language) if re.search(r"출력|output", problem, re.I) else set()
-    excluded = 0
-    seen_questions: set[tuple[int, str, str, str]] = set()
-    for number, step in enumerate(generated.steps, start=1):
+def verified_choices(answer: str, numeric: bool) -> list[str]:
+    """모델이 정답 선택지를 정하지 못하게 관측값에서 오답을 만든다."""
+    if numeric and re.fullmatch(r"-?\d+", answer):
+        number = int(answer)
+        choices = [str(number - 1), answer, str(number + 1)]
+    else:
         try:
-            candidate = build_trace_step(step, lines, number)
-            identity = (
-                candidate.line_number, candidate.question_kind,
-                candidate.target, candidate.context.strip(),
-            )
-            if identity in seen_questions:
-                raise GenerationValidationError(number, "같은 시점의 질문이 중복됨")
-        except GenerationValidationError as exc:
-            if not prints or step.question_kind != "value_after":
-                raise
-            excluded += 1
-            LOGGER.warning("불일치 보조 문항 제외: %s", json.dumps(exc.diagnostics, ensure_ascii=False))
+            literal = json.loads(answer)
+        except (ValueError, TypeError):
+            literal = None
+        if isinstance(literal, str):
+            choices = [answer, json.dumps(literal + "?", ensure_ascii=False),
+                       json.dumps(literal + "!", ensure_ascii=False)]
+        else:
+            choices = [answer, answer + "?", answer + "!"]
+    random.SystemRandom().shuffle(choices)
+    return choices
+
+
+def build_verified_tutorial(
+    language: str, source: str, probes: list[dict[str, Any]], observations: list[dict[str, Any]], stdout: str
+) -> Tutorial:
+    """모델의 숫자는 받지 않고, 실행 결과만 정답·주석의 근거로 쓴다."""
+    lines = source.split("\n")
+    selected: list[dict[str, Any]] = []
+    for probe_id, probe in enumerate(probes):
+        events = [item for item in observations if item.get("id") == probe_id]
+        if not events:
             continue
-        seen_questions.add(identity)
-        candidate.step_number = len(steps) + 1
-        steps.append(candidate)
+        changed = [item for item in events if item.get("before") != item.get("after")]
+        changed = [item for item in changed if re.fullmatch(r"-?\d+", str(item.get("after", "")))]
+        if not changed:
+            continue
+        def importance(event: dict[str, Any]) -> tuple[int, int]:
+            try:
+                delta = abs(int(event["after"]) - int(event["before"]))
+            except (TypeError, ValueError):
+                delta = 1
+            return (delta, -int(event["occurrence"]))
+        selected.append(max(changed, key=importance))
+    selected.sort(key=lambda item: int(item.get("event_index", item["line_number"])))
+
+    steps: list[TraceStep] = []
+    for event in selected[:6]:
+        before, after = str(event["before"]), str(event["after"])
+        line_number, target = int(event["line_number"]), str(event["target"])
+        occurrence = int(event["occurrence"])
+        context = f"{occurrence}번째 실행" if occurrence > 1 else ""
+        change = StateChange(target=target, before=before, after=after, calculations=[])
+        explanation = (
+            f"{line_number}행의 {occurrence}번째 실행에서 `{target}`의 값이 "
+            f"{before} → {after}로 바뀝니다."
+        )
+        context_values = [
+            f"`{expression}` = {value}"
+            for expression, value in event.get("context_values", {}).items()
+            if re.fullmatch(r"-?\d+", str(value))
+        ]
+        if context_values:
+            explanation += " 계산에 쓰인 관측값: " + ", ".join(context_values) + "."
+        steps.append(TraceStep(
+            line_number=line_number,
+            question=question_for("value_after", line_number, target, context),
+            choices=verified_choices(after, numeric=True), answer=after,
+            hint="대입식의 오른쪽과 실행 직전 값을 함께 살펴보세요.",
+            explanation=explanation, step_number=len(steps) + 1,
+            code_line=lines[line_number - 1], question_kind="value_after",
+            target=target, context=context, changes=[change],
+            verified_fact={"source": "probe", **event},
+        ))
+
+    printed_lines = output_lines(source, language)
+    if stdout:
+        line_number = max(printed_lines) if printed_lines else max(
+            number for number, line in enumerate(lines, 1) if line.strip()
+        )
+        answer = display_output(stdout)
+        steps.append(TraceStep(
+            line_number=line_number,
+            question=question_for("program_output", line_number, "표준 출력", ""),
+            choices=verified_choices(answer, numeric=bool(re.fullmatch(r"-?\d+", answer))),
+            answer=answer,
+            hint="이전 행의 값 변화를 반영해 최종 출력을 확인해 보세요.",
+            explanation=f"격리 환경에서 원본 코드를 실행해 확인한 표준 출력은 {answer}입니다.",
+            step_number=len(steps) + 1, code_line=lines[line_number - 1],
+            question_kind="program_output", target="표준 출력", context="",
+            verified_fact={"source": "stdout", "line_number": line_number},
+        ))
     if not steps:
-        raise GenerationValidationError(0, "검증을 통과한 문항이 없음")
-    if prints:
-        if prints and not any(
-            step.question_kind == "diagnostic"
-            or (step.question_kind in ("output_this_step", "output_so_far") and step.line_number in prints)
-            for step in steps
-        ):
-            raise GenerationValidationError(0, "요구된 출력 또는 실행 오류에 대한 핵심 문항이 없음")
-    return validate_tutorial(
-        Tutorial(
-            language=generated.language,
-            steps=steps,
-            annotated_code=review_code(source, language, generated.line_notes, steps),
-            schema_version=QUIZ_SCHEMA_VERSION,
-            line_notes=generated.line_notes,
-            excluded_steps=excluded,
-        ).model_dump(),
-        language,
-        source,
+        raise TutorialError(
+            "실행으로 확인된 출제 지점이 없습니다. 출력문 또는 단일 행 대입문이 있는 코드를 사용해 주세요."
+        )
+    tutorial = Tutorial(
+        language=language, steps=steps, annotated_code=review_code(source, language, [], steps),
+        schema_version=VERIFIED_SCHEMA_VERSION,
+        execution_verified=True, stdout=stdout,
     )
+    return validate_tutorial(tutorial.model_dump(), language, source)
 
 
 def describe_api_error(exc: Exception) -> str:
@@ -556,57 +524,39 @@ def generate_tutorial(
     language: str,
     problem: str,
     source: str,
-    on_retry: Callable[[], None] | None = None,
+    sandbox_settings: dict[str, str] | None = None,
 ) -> Tutorial:
-    """값·선택지 불일치에만 한 번 더 요청하고 검증된 튜토리얼을 반환한다."""
+    """모델은 관측 위치만 고르고, 정답은 격리 실행 결과에서 만든다."""
+    if not sandbox_settings or not all(
+        sandbox_settings.get(name, "").strip() for name in ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET")
+    ):
+        raise TutorialError("실행 검증용 샌드박스가 아직 설정되지 않았습니다. 관리자에게 문의해 주세요.")
+    if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+        raise TutorialError("코드가 너무 깁니다. 24KB 이하로 줄여 주세요.")
     started = time.perf_counter()
     try:
-        # 긴 자동 재시도로 사용자가 기다리지 않도록 제한한다.
         client = OpenAI(api_key=api_key, timeout=60.0, max_retries=0)
-        prompt = build_prompt(language, problem, source)
-        for attempt in range(2):
-            response = client.responses.parse(
-                model=model,
-                input=prompt,
-                text_format=GeneratedTutorial,
-                store=False,
+        response = client.responses.parse(
+            model=model, input=plan_prompt(language, problem, source),
+            text_format=ProbePlan, store=False,
+        )
+        if response.status == "incomplete":
+            raise TutorialError("OpenAI 응답이 중간에 끊겼습니다. 코드를 줄여 다시 생성해 주세요.")
+        try:
+            payload = (
+                response.output_parsed.model_dump() if response.output_parsed is not None
+                else parse_json_object(getattr(response, "output_text", ""))
             )
-            if response.status == "incomplete":
-                raise TutorialError("OpenAI 응답이 중간에 끊겼습니다. 코드를 줄여 다시 생성해 주세요.")
-            try:
-                payload = (
-                    response.output_parsed.model_dump()
-                    if response.output_parsed is not None
-                    else parse_json_object(getattr(response, "output_text", ""))
-                )
-                return finalize_generated_tutorial(payload, language, source, problem)
-            except TutorialError as original_error:
-                exc = (
-                    original_error if isinstance(original_error, GenerationValidationError)
-                    else GenerationValidationError(0, str(original_error))
-                )
-                diagnostics = {
-                    **exc.diagnostics,
-                    "model": model,
-                    "attempt": attempt + 1,
-                    "response_id": getattr(response, "id", None) or "",
-                    "elapsed_seconds": round(time.perf_counter() - started, 1),
-                }
-                LOGGER.warning("생성 내용 검증 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
-                if attempt:
-                    exc.diagnostics["retry_count"] = 1
-                    raise
-                if on_retry:
-                    on_retry()
-                prompt += (
-                    f"\n\n앞선 응답의 {exc.diagnostics['step_number']}번 문항 또는 전체 결과에서 "
-                    f"{exc.diagnostics['reason']} 오류가 있어 폐기했습니다. "
-                    "원본 소스를 다시 추적하고, 정답·값 변화·계산·서로 다른 오답 2개가 "
-                    "모두 일치하는 전체 결과를 새로 작성하세요."
-                )
-        raise AssertionError("재시도 횟수를 초과했습니다.")
+            plan = ProbePlan.model_validate(payload)
+        except ValidationError as exc:
+            raise TutorialError("모델이 확인할 코드 행을 올바르게 제안하지 못했습니다.") from exc
+        probes = validate_probe_plan(plan, source, language)
+        observed = run_isolated_trace(language, source, probes, sandbox_settings)
+        return build_verified_tutorial(language, source, probes, observed["observations"], observed["stdout"])
     except TutorialError:
         raise
+    except TraceError as exc:
+        raise TutorialError(str(exc)) from None
     except Exception as exc:
         diagnostics = api_error_diagnostics(exc, api_key, model)
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 1)
@@ -614,10 +564,13 @@ def generate_tutorial(
         raise TutorialError(describe_api_error(exc), diagnostics) from None
 
 
-def run_generation_job(api_key: str, model: str, language: str, problem: str, source: str) -> dict[str, Any]:
+def run_generation_job(
+    api_key: str, model: str, language: str, problem: str, source: str,
+    sandbox_settings: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """스레드에서 오류를 자료로 바꿔 Streamlit 재실행 뒤에도 정확한 사유를 보존한다."""
     try:
-        tutorial = generate_tutorial(api_key, model, language, problem, source)
+        tutorial = generate_tutorial(api_key, model, language, problem, source, sandbox_settings)
     except TutorialError as exc:
         return {"tutorial": None, "error": str(exc), "diagnostics": exc.diagnostics}
     return {"tutorial": tutorial.model_dump(), "error": None, "diagnostics": None}
@@ -962,15 +915,20 @@ def show_study_view() -> None:
     st.caption(f"학습 형식 v{quiz.get('schema_version', 1)}")
     if quiz.get("excluded_steps"):
         st.caption(f"값·정답이 맞지 않는 보조 문항 {quiz['excluded_steps']}개를 제외했습니다.")
-    if quiz.get("schema_version", 1) < QUIZ_SCHEMA_VERSION:
-        st.warning("기존 방식으로 만든 문제입니다. 새 값 변화 설명을 적용하려면 아래 버튼으로 새 문제를 준비하세요.")
-        if st.button("이 코드로 새 형식 생성 준비"):
+    if quiz.get("schema_version", 1) < VERIFIED_SCHEMA_VERSION:
+        st.warning(
+            "이 기록은 실제 코드 실행으로 검증하기 전에 만들었습니다. "
+            "정답이 틀릴 수 있어 채점을 중단했습니다. 원본으로 검증된 새 문제를 생성해 주세요."
+        )
+        st.code(st.session_state["study_source"], language=LANGUAGES[language], line_numbers=True)
+        if st.button("이 코드로 검증된 문제 생성 준비"):
             st.session_state["prefill_generation"] = {
                 "language": language,
                 "problem": st.session_state["study_problem"],
                 "source": st.session_state["study_source"],
             }
             st.rerun()
+        return
     if st.session_state["generation_seconds"] is not None:
         st.caption(f"생성 소요 시간: {st.session_state['generation_seconds']:.1f}초")
 
@@ -1113,7 +1071,7 @@ def show_generation_status(store: ArchiveStore, owner: str) -> None:
         if job["owner"] != owner:
             return
         if not job["future"].done():
-            st.info("실행 흐름을 분석하고 핵심 문제를 만들고 있습니다. 다른 화면을 사용해도 됩니다.")
+            st.info("핵심 행을 고른 뒤 격리 실행으로 정답을 검증하고 있습니다. 다른 화면을 사용해도 됩니다.")
             return
         st.session_state["generation_job"] = None
         job["executor"].shutdown(wait=False)
@@ -1161,6 +1119,13 @@ def show_generation_status(store: ArchiveStore, owner: str) -> None:
 
 def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
     """생성 결과가 보관된 뒤에만 현재 학습을 교체한다."""
+    sandbox_settings = {
+        "MODAL_TOKEN_ID": setting("MODAL_TOKEN_ID"),
+        "MODAL_TOKEN_SECRET": setting("MODAL_TOKEN_SECRET"),
+    }
+    sandbox_ready = all(sandbox_settings.values())
+    if not sandbox_ready:
+        st.warning("실행 검증용 샌드박스 설정이 아직 없습니다. 관리자 설정 후 새 문제를 생성할 수 있습니다.")
     prefill = st.session_state.get("prefill_generation")
     if prefill:
         st.session_state[f"language_input_{owner}"] = prefill["language"]
@@ -1172,8 +1137,9 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
         language = st.selectbox("프로그래밍 언어", list(LANGUAGES), key=f"language_input_{owner}")
         problem = st.text_area("문제 설명", placeholder="예: 다음 프로그램의 실행 결과는?", key=f"problem_input_{owner}")
         source = st.text_area("소스 코드", height=260, placeholder="코드를 여기에 붙여 넣으세요.", key=f"source_input_{owner}")
+        st.caption("입력한 코드는 OpenAI에 출제 지점 선별용으로 전송되고, Modal 격리 샌드박스에서 실행됩니다.")
         requested = st.form_submit_button(
-            "핵심 문제 생성", disabled=st.session_state["generation_job"] is not None
+            "핵심 문제 생성", disabled=st.session_state["generation_job"] is not None or not sandbox_ready
         )
 
     if requested:
@@ -1192,7 +1158,10 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
                 st.error(str(exc))
             else:
                 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-generation")
-                future = executor.submit(run_generation_job, api_key, model.strip(), language, problem, source)
+                future = executor.submit(
+                    run_generation_job, api_key, model.strip(), language, problem, source,
+                    sandbox_settings,
+                )
                 st.session_state["generation_job"] = {
                     "future": future,
                     "executor": executor,
@@ -1251,6 +1220,14 @@ def show_archive_view(store: ArchiveStore, owner: str) -> None:
                 try:
                     original = store.get_tutorial(owner, record_id)
                     validate_tutorial(original["quiz"], original["language"], original["source"])
+                    if original["quiz"].get("schema_version", 1) < VERIFIED_SCHEMA_VERSION:
+                        st.session_state["prefill_generation"] = {
+                            "problem": original["problem"],
+                            "language": original["language"],
+                            "source": original["source"],
+                        }
+                        st.session_state["view"] = "학습"
+                        st.rerun()
                     replay = new_tutorial_record(
                         original["problem"], original["language"], original["source"],
                         original["model"], original["quiz"],
@@ -1290,7 +1267,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 2")
+    st.caption("C · C++ · Java · Python | 앱 버전 3 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:

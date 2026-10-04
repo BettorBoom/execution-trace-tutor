@@ -10,7 +10,8 @@ from cryptography.fernet import Fernet
 from streamlit.testing.v1 import AppTest
 from types import SimpleNamespace as Namespace
 
-from app import GeneratedTutorial, acknowledge_result, apply_record, open_hint, submit_answer
+from app import acknowledge_result, apply_record, open_hint, submit_answer
+from verified_trace import ProbePlan
 from storage import (
     ArchiveStore,
     KeyUnavailable,
@@ -22,7 +23,7 @@ from storage import (
     google_owner,
     new_tutorial_record,
 )
-from test_app import SOURCE, finish_generation, generated_payload, payload
+from test_app import SOURCE, VERIFIED_SETTINGS, finish_generation, payload, verified_payload
 
 
 class FakeQuery:
@@ -221,14 +222,15 @@ class StorageTests(unittest.TestCase):
 
     def test_archive_reopens_on_another_session_without_openai(self):
         self.store.save_key("google:a", "sk-a")
-        record = new_tutorial_record("x의 값", "C", SOURCE, "gpt-4.1-mini", payload())
+        record = new_tutorial_record("x의 값", "C", SOURCE, "gpt-4.1-mini", verified_payload())
         self.store.insert_tutorial("google:a", record)
         with patch("app.google_owner", return_value="google:a"), patch("app.make_store", return_value=self.store), patch("app.generate_tutorial") as generate:
             first = AppTest.from_string("import app\napp.main()").run(timeout=15)
             next(button for button in first.button if button.label == "내 문제 보관함").click().run(timeout=15)
             first.button(key=f"open_{record['id']}").click().run(timeout=15)
             self.assertEqual(first.session_state["current_step_idx"], 0)
-            choice_key = f"choice_{first.session_state['generation_count']}_0_2"
+            correct = first.session_state["quiz_data"]["steps"][0]["choices"].index("1") + 1
+            choice_key = f"choice_{first.session_state['generation_count']}_0_{correct}"
             first.button(key=choice_key).click().run(timeout=15)
             self.assertEqual(first.session_state["current_step_idx"], 1)
             self.assertTrue(first.session_state["awaiting_next"])
@@ -244,8 +246,14 @@ class StorageTests(unittest.TestCase):
 
     def test_generated_result_retries_database_without_openai(self):
         self.store.save_key("google:a", "sk-a")
-        parsed = GeneratedTutorial.model_validate(generated_payload())
-        with patch("app.google_owner", return_value="google:a"), patch("app.make_store", return_value=self.store), patch("app.OpenAI") as client_class:
+        parsed = ProbePlan.model_validate({"probes": [
+            {"line_number": 2, "target": "x", "reason": "값 변화"}
+        ]})
+        observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
+            "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
+        with patch("app.google_owner", return_value="google:a"), patch("app.make_store", return_value=self.store), \
+             patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")), \
+             patch("app.run_isolated_trace", return_value=observed), patch("app.OpenAI") as client_class:
             client_class.return_value.responses.parse.return_value = Namespace(output_parsed=parsed, status="completed")
             page = AppTest.from_string("import app\napp.main()").run(timeout=15)
             page.text_area[0].set_value("x의 값")
