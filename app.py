@@ -774,6 +774,7 @@ def initialize_state() -> None:
         "owner_id": None,
         "view": "학습",
         "pending_generation": None,
+        "pending_save_error": None,
         "generation_job": None,
         "generation_error": None,
         "prefill_generation": None,
@@ -808,6 +809,7 @@ def reset_study(state: Any) -> None:
         "active_record_id": None,
         "active_version": 0,
         "pending_generation": None,
+        "pending_save_error": None,
         "generation_job": None,
         "generation_error": None,
         "prefill_generation": None,
@@ -829,6 +831,7 @@ def apply_record(state: Any, record: dict[str, Any]) -> None:
         progress = check_progress(record["progress"], len(tutorial.steps))
         record_id, version = record["id"], record["version"]
     except (KeyError, TypeError, ValueError, TutorialError) as exc:
+        LOGGER.error("저장 기록 검증 실패 (%s): %s", type(exc).__name__, str(exc)[:300])
         raise StorageError("저장된 문제 기록을 읽을 수 없습니다.") from None
     state["quiz_data"] = tutorial.model_dump()
     state["current_step_idx"] = progress["current_step_idx"]
@@ -1072,17 +1075,22 @@ def save_pending_generation(store: ArchiveStore, owner: str) -> None:
     if not pending:
         return
     st.warning("생성된 문제를 아직 보관하지 못했습니다. 저장을 다시 시도할 수 있습니다.")
+    if st.session_state.get("pending_save_error"):
+        st.error(st.session_state["pending_save_error"])
     if st.button("생성된 문제 저장 다시 시도"):
         try:
             record = store.insert_tutorial(owner, pending)
             apply_record(st.session_state, record)
         except (StorageError, TutorialError) as exc:
+            st.session_state["pending_save_error"] = str(exc)
             st.error(str(exc))
         else:
             st.session_state["pending_generation"] = None
+            st.session_state["pending_save_error"] = None
             st.rerun()
     if st.button("저장하지 않고 버리기"):
         st.session_state["pending_generation"] = None
+        st.session_state["pending_save_error"] = None
         st.rerun()
 
 
@@ -1124,9 +1132,10 @@ def show_generation_status(store: ArchiveStore, owner: str) -> None:
                 saved = store.insert_tutorial(owner, record)
                 apply_record(st.session_state, saved)
             except (StorageError, TutorialError) as exc:
-                st.error(str(exc))
+                st.session_state["pending_save_error"] = str(exc)
             else:
                 st.session_state["pending_generation"] = None
+                st.session_state["pending_save_error"] = None
                 st.session_state["generation_seconds"] = time.perf_counter() - job["started"]
                 st.session_state["view"] = "학습"
             st.rerun()
@@ -1290,7 +1299,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.1 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.2 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:
