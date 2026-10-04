@@ -11,6 +11,7 @@ import httpx2
 
 from app import (
     GeneratedTutorial,
+    GenerationValidationError,
     TutorialError,
     acknowledge_result,
     advance_step,
@@ -20,7 +21,9 @@ from app import (
     generate_tutorial,
     highlight_source,
     normalize_answer,
+    output_lines,
     parse_json_object,
+    run_generation_job,
     submit_answer,
     validate_tutorial,
     build_prompt,
@@ -159,6 +162,13 @@ class TutorialTests(unittest.TestCase):
                 tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE)
         self.assertEqual(tutorial.steps[0].answer, "1")
         self.assertEqual(client_class.return_value.responses.parse.call_count, 2)
+
+    def test_background_job_returns_serializable_diagnostics(self):
+        with patch("app.generate_tutorial", side_effect=GenerationValidationError(2, "값이 다름")):
+            result = run_generation_job("test-key", "gpt-4.1-mini", "C", "출력값은?", SOURCE)
+        self.assertIsNone(result["tutorial"])
+        self.assertEqual(result["diagnostics"], {"step_number": 2, "reason": "값이 다름"})
+        self.assertNotIn("test-key", json.dumps(result, ensure_ascii=False))
 
     def test_generated_line_number_still_validated(self):
         with self.assertRaises(TutorialError):
@@ -325,6 +335,36 @@ class TutorialTests(unittest.TestCase):
         self.assertTrue(any("맞았습니다" in item.value for item in app.success))
         self.assertTrue(any("6 → 1" in item.value for item in app.markdown))
         self.assertTrue(any(button.label == "학습 마치기" for button in app.button))
+
+    def test_output_problem_requires_output_question(self):
+        self.assertEqual(output_lines(POINTER_SOURCE, "C"), {14})
+        self.assertEqual(output_lines("#print(0)\nprint(1)", "Python"), {2})
+        self.assertEqual(output_lines("std::cout << x;", "C++"), {1})
+        self.assertEqual(output_lines("System.out.println(x);", "Java"), {1})
+
+        generated = {
+            "language": "C", "steps": [{
+                "line_number": 13, "question_kind": "value_after", "target": "num",
+                "context": "함수 호출 후", "answer": "1", "distractors": ["0", "4"],
+                "hint": "배열의 세 번째 값을 살펴보세요.",
+                "explanation": "num은 6에서 1로 바뀝니다.",
+                "changes": [{"target": "num", "before": "6", "after": "1", "calculations": []}],
+            }],
+            "line_notes": [{"line_number": 4, "note": "i=2에서 arr[2]는 4에서 1이 됩니다."}],
+        }
+        with self.assertRaises(GenerationValidationError) as raised:
+            finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
+        self.assertIn("출력", raised.exception.diagnostics["reason"])
+
+        generated["steps"].append({
+            "line_number": 14, "question_kind": "output_this_step", "target": "printf(\"%d\", num)",
+            "context": "num에 arr[2]를 넣은 뒤", "answer": "1", "distractors": ["0", "4"],
+            "hint": "printf가 받는 num의 값을 확인하세요.",
+            "explanation": "arr[2]가 1이므로 printf는 1을 출력합니다.", "changes": [],
+        })
+        result = finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
+        self.assertEqual(result.steps[-1].line_number, 14)
+        self.assertEqual(result.steps[-1].answer, "1")
 
     def test_raw_json_fallback_builds_step_numbers(self):
         response = SimpleNamespace(

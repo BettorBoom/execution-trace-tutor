@@ -153,6 +153,8 @@ def build_prompt(language: str, problem: str, source: str) -> str:
 실제 실행 순서에서 학습 가치가 높은 지점만 1~7개 고르세요. 짧은 코드는 억지로 채우지 마세요.
 최종 출력·문제에서 요구한 결과·오류 원인, 포인터/참조/배열/슬라이싱, 함수 부수 효과와
 반복문의 핵심 값 변화를 우선하세요. 단순 상수 초기화와 같은 의미의 반복 질문은 피하세요.
+문제가 출력값을 요구하고 코드에 출력문이 있으면, 마지막 출력문 또는 그 결과를 확정할 수
+없는 오류 지점을 반드시 문항으로 포함하세요. 출력값 문항의 line_number는 실제 출력문 행입니다.
 질문하지 않는 줄과 반복 회차도 실행한 것으로 계산하세요. 같은 줄의 반복 출제는 context에
 반복 변수와 이번 회차를 명시하세요. context와 hint에 정답 값을 미리 쓰지 마세요.
 line_number는 아래 1-based 물리적 줄 번호이며 steps는 실제 실행 순서입니다.
@@ -360,7 +362,24 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
     return tutorial
 
 
-def finalize_generated_tutorial(payload: dict[str, Any], language: str, source: str) -> Tutorial:
+def output_lines(source: str, language: str) -> set[int]:
+    """출력 결과를 묻는 문제에서 핵심 문항의 물리적 행을 확인한다."""
+    pattern = {
+        "C": r"\b(?:printf|puts|putchar)\s*\(",
+        "C++": r"\b(?:printf|puts|putchar)\s*\(|\b(?:std::)?cout\s*<<",
+        "Java": r"\bSystem\.out\.(?:print|println|printf)\s*\(",
+        "Python": r"\bprint\s*\(",
+    }[language]
+    return {
+        number for number, line in enumerate(source.split("\n"), start=1)
+        if not line.lstrip().startswith("#" if language == "Python" else ("//", "/*", "*"))
+        and re.search(pattern, line)
+    }
+
+
+def finalize_generated_tutorial(
+    payload: dict[str, Any], language: str, source: str, problem: str = ""
+) -> Tutorial:
     """모델이 판단한 줄 번호를 검증하고, 순서와 원문은 앱에서 확정한다."""
     if isinstance(payload.get("steps"), list) and not 1 <= len(payload["steps"]) <= 7:
         raise GenerationValidationError(0, "문항 수가 1~7개가 아님")
@@ -414,6 +433,14 @@ def finalize_generated_tutorial(payload: dict[str, Any], language: str, source: 
                 changes=step.changes,
             )
         )
+    if re.search(r"출력|output", problem, re.I):
+        prints = output_lines(source, language)
+        if prints and not any(
+            step.question_kind == "diagnostic"
+            or (step.question_kind in ("output_this_step", "output_so_far") and step.line_number in prints)
+            for step in steps
+        ):
+            raise GenerationValidationError(0, "요구된 출력 또는 실행 오류에 대한 핵심 문항이 없음")
     return validate_tutorial(
         Tutorial(
             language=generated.language,
@@ -520,7 +547,7 @@ def generate_tutorial(
                     if response.output_parsed is not None
                     else parse_json_object(getattr(response, "output_text", ""))
                 )
-                return finalize_generated_tutorial(payload, language, source)
+                return finalize_generated_tutorial(payload, language, source, problem)
             except TutorialError as original_error:
                 exc = (
                     original_error if isinstance(original_error, GenerationValidationError)
