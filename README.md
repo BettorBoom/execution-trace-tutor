@@ -28,13 +28,13 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 
 ## Streamlit Community Cloud 배포
 
-현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. GitHub 계정명을 `theBettor`에서 `BettorBoom`으로 바꾼 뒤 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)의 관리 화면에는 예전 경로가 표시되지만, **Manage app → ⋮ → Reboot app**으로 재부팅하면 GitHub 리디렉션을 통해 최신 `main` 코드를 다시 가져오는 것을 확인했습니다. 이 방식은 기존 주소·Secrets·Google 로그인 콜백을 유지합니다. 이름 변경 후 자동 배포 웹훅은 검증되지 않았으므로, 코드를 올린 뒤 화면의 `앱 버전 4.3 · 실행 검증`과 새 기능을 확인하고 갱신되지 않았다면 재부팅하세요.
+현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. GitHub 계정명을 `theBettor`에서 `BettorBoom`으로 바꾼 뒤 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)의 관리 화면에는 예전 경로가 표시되지만, **Manage app → ⋮ → Reboot app**으로 재부팅하면 GitHub 리디렉션을 통해 최신 `main` 코드를 다시 가져오는 것을 확인했습니다. 이 방식은 기존 주소·Secrets·Google 로그인 콜백을 유지합니다. 이름 변경 후 자동 배포 웹훅은 검증되지 않았으므로, 코드를 올린 뒤 화면의 `앱 버전 4.4 · 실행 검증`과 새 기능을 확인하고 갱신되지 않았다면 재부팅하세요.
 
 나중에 새 GitHub 경로로 Cloud 앱을 다시 만들려면 [Community Cloud 대시보드](https://share.streamlit.io)에서 `BettorBoom/execution-trace-tutor`, `main`, `app.py`를 지정합니다. 이 경우 새 주소에 맞춰 Secrets와 Google 로그인 콜백을 다시 설정해야 합니다.
 
 새 앱으로 옮길 때만 **⋮ → Settings → Secrets**에 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)의 항목을 입력합니다. `redirect_uri`에는 **새 앱의 실제 주소** 뒤에 `/oauth2callback`을 붙인 값을 넣고, Google Cloud의 승인된 리디렉션 URI에도 똑같은 값을 추가합니다. `cookie_secret`은 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. Supabase URL·서버 키, **기존과 동일한** 암호화 키, Google 클라이언트 값이 모두 필요합니다. 특히 암호화 키를 바꾸면 기존에 저장된 개인 API 키를 읽을 수 없습니다. 문의 메일은 기본값 `be0128st@gmail.com`이며 Secrets의 `CONTACT_EMAIL`로 변경할 수 있습니다.
 
-배포 후 화면 상단의 `앱 버전 4.3 · 실행 검증` 표시를 확인합니다. Google 로그인과 개인 OpenAI 키 등록 후, C 포인터 예제로 4행의 `4→1`, 13행의 `6→1`, 최종 출력 `1`이 표시되는지 확인합니다. **실제 API 키·Modal 토큰·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
+배포 후 화면 상단의 `앱 버전 4.4 · 실행 검증` 표시를 확인합니다. Google 로그인과 개인 OpenAI 키 등록 후, C 포인터 예제로 4행의 `4→1`, 13행의 `6→1`, 최종 출력 `1`이 표시되는지 확인합니다. **실제 API 키·Modal 토큰·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
 
 Streamlit 인증 앱은 Community Cloud의 비공개 앱 한도에 포함됩니다. Google 로그인은 Streamlit이 처리하고, 사용자의 API 키는 암호화된 형태로 Supabase에 저장됩니다. Supabase 서버용 키와 암호화 키는 공개 저장소에 넣지 마세요.
 

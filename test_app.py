@@ -212,6 +212,16 @@ class TutorialTests(unittest.TestCase):
         self.assertEqual(probes[0]["context_exprs"], ["arr[2]"])
         self.assertEqual([item["id"] for item in probes], [0, 1])
 
+    def test_rhs_probe_is_retargeted_to_assigned_array_cell(self):
+        source = "int main(){\n int mines[2][3]={{0,1,0},{1,0,0}};\n int x=1,y=1;\n mines[y][x] = mines[y][x] + x + y;\n printf(\"%d\", mines[y][x]);\n}"
+        plan = ProbePlan.model_validate({"probes": [
+            {"line_number": 4, "target": "mines[y][x] + x + y", "reason": "배열 값 변화"},
+        ]})
+        self.assertEqual(validate_probe_plan(plan, source, "C"), [
+            {"id": 0, "line_number": 4, "target": "mines[y][x]",
+             "context_exprs": ["mines[y][x] + x + y"]},
+        ])
+
     def test_output_dependency_fallback_covers_other_languages(self):
         samples = (
             ("C++", "int main(){\nint x=1;\nx=x+2;\nstd::cout << x;\n}", 3),

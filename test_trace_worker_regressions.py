@@ -154,6 +154,7 @@ print(f(2))'''
             ("C", "int x=1;"), ("C++", "int *p=nullptr;"),
             ("Java", "Integer x=1;"), ("C", "x=1; y=2;"),
             ("Python", "x=1; print(x)"), ("Python", "if True: x=1"),
+            ("Python", "x: int"),
         ):
             with self.subTest(language=language, source=source):
                 self.assertEqual(_instrument(source, language, [{"id": 0, "line_number": 1, "target": "x"}]), source)

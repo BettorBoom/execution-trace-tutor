@@ -82,7 +82,9 @@ def _python_line_is_safe(source: str, number: int) -> bool:
         tree = ast.parse(source.split("\n")[number - 1].strip())
     except SyntaxError:
         return False
-    return len(tree.body) == 1 and isinstance(tree.body[0], (ast.Assign, ast.AugAssign, ast.AnnAssign))
+    return (len(tree.body) == 1
+            and isinstance(tree.body[0], (ast.Assign, ast.AugAssign, ast.AnnAssign))
+            and not (isinstance(tree.body[0], ast.AnnAssign) and tree.body[0].value is None))
 
 
 def _assignment_line_is_safe(code: str) -> bool:

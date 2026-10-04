@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from trace_worker import _assignment_line_is_safe, _python_line_is_safe
 
 
 MAX_SOURCE_BYTES = 24_000
@@ -43,7 +44,8 @@ def plan_prompt(language: str, problem: str, source: str) -> str:
 단순 상수 초기화, 중복 질문, 단독 중괄호, 주석은 제외하세요.
 같은 실행 행의 같은 값을 공백이나 표기만 달리해 두 번 제안하지 마세요.
 각 probe의 line_number는 실행 직후 값을 볼 단일 행 대입문의 물리적 줄 번호입니다.
-target은 그 시점에 읽을 수 있는 정수 변수/배열 원소/역참조 표현식입니다.
+target은 그 행의 대입문 왼쪽 대상인 정수 변수/배열 원소/역참조 표현식입니다.
+오른쪽 계산식 자체를 target으로 제안하지 마세요. 계산식은 context_exprs에 넣으세요.
 실행 직전에도 이미 선언되고 초기화되어 있는 대상만 고르세요.
 int x=3, int* p=arr, int** pp=&p 같은 선언문은 제외하세요. 포인터 주소 자체도 대상이 아닙니다.
 포인터 문제라면 *(*arr+i)=... 같은 실제 원소 대입과 num=arr[2] 같은 결과 대입을 고르세요.
@@ -101,6 +103,27 @@ def _output_assignment(source: str, language: str) -> tuple[int, str, str] | Non
     return None
 
 
+def _assigned_target(source: str, line_number: int, language: str) -> tuple[str, str] | None:
+    """계측 가능한 대입문의 왼쪽 대상과 오른쪽 식을 원본에서 읽는다."""
+    code = source.split("\n")[line_number - 1].strip()
+    if language == "Python":
+        if not _python_line_is_safe(source, line_number):
+            return None
+        node = ast.parse(code).body[0]
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) != 1:
+            return None
+        left, right = ast.unparse(targets[0]), ast.unparse(node.value)
+    else:
+        if not _assignment_line_is_safe(code):
+            return None
+        operator = re.search(r"(?<![=!<>])(?:[+*/%&|^-]|<<|>>)?=(?!=)", code)
+        if operator is None:
+            return None
+        left, right = code[:operator.start()].strip(), code[operator.end():].rstrip(";").strip()
+    return (left, right) if _valid_expression(left, language) else None
+
+
 def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dict[str, Any]]:
     """모델은 위치와 표현식만 제안하며 실행 가능 여부는 워커가 검사한다."""
     lines = source.split("\n")
@@ -112,6 +135,10 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
         line, expr = item.line_number, item.target.strip()
         if not 1 <= line <= len(lines) or not _valid_expression(expr, language):
             continue
+        assigned = _assigned_target(source, line, language)
+        model_target = expr
+        if assigned:
+            expr = assigned[0]
         identity = (line, re.sub(r"\s+", "", expr))
         if identity in seen:
             continue
@@ -121,6 +148,10 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
             candidate = candidate.strip()
             if candidate != expr and candidate not in context_exprs and _valid_expression(candidate, language):
                 context_exprs.append(candidate)
+        if (assigned and re.sub(r"\s+", "", model_target) == re.sub(r"\s+", "", assigned[1])
+                and not any(re.sub(r"\s+", "", value) == re.sub(r"\s+", "", model_target)
+                            for value in context_exprs)):
+            context_exprs = [model_target, *context_exprs][:4]
         probes.append({"id": len(probes), "line_number": line, "target": expr,
                        "context_exprs": context_exprs})
     output_assignment = _output_assignment(source, language)
