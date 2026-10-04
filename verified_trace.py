@@ -41,6 +41,7 @@ def plan_prompt(language: str, problem: str, source: str) -> str:
 정답 값이나 해설은 만들지 마세요. 실제 실행으로 확인할 읽기 전용 표현식만 제안하세요.
 최종 출력, 포인터/참조/배열, 함수 부수 효과, 분기와 반복의 핵심 변화를 우선하세요.
 단순 상수 초기화, 중복 질문, 단독 중괄호, 주석은 제외하세요.
+같은 실행 행의 같은 값을 공백이나 표기만 달리해 두 번 제안하지 마세요.
 각 probe의 line_number는 실행 직후 값을 볼 단일 행 대입문의 물리적 줄 번호입니다.
 target은 그 시점에 읽을 수 있는 정수 변수/배열 원소/역참조 표현식입니다.
 실행 직전에도 이미 선언되고 초기화되어 있는 대상만 고르세요.
@@ -77,6 +78,29 @@ def _valid_expression(expr: str, language: str) -> bool:
     return not re.search(r"\b[A-Za-z_]\w*\s*\(", expr)
 
 
+def _output_assignment(source: str, language: str) -> tuple[int, str, str] | None:
+    """단순 출력 변수의 마지막 대입을 놓쳤다면 검증 후보로 보탠다."""
+    output_pattern = {
+        "C": r'\bprintf\s*\(\s*"[^"]*"\s*,\s*([A-Za-z_]\w*)\s*\)',
+        "C++": r'\b(?:std::)?cout\s*<<\s*([A-Za-z_]\w*)\b',
+        "Java": r'\bSystem\.out\.(?:print|println)\s*\(\s*([A-Za-z_]\w*)\s*\)',
+        "Python": r'\bprint\s*\(\s*([A-Za-z_]\w*)\s*\)',
+    }[language]
+    lines = source.split("\n")
+    for output_line in range(len(lines), 0, -1):
+        match = re.search(output_pattern, lines[output_line - 1])
+        if not match:
+            continue
+        target = match.group(1)
+        suffix = "" if language == "Python" else ";"
+        assignment = re.compile(rf"^\s*{re.escape(target)}\s*(?:[+*/%-]?=(?!=))\s*(.+?){suffix}\s*$")
+        for line_number in range(output_line - 1, 0, -1):
+            assigned = assignment.fullmatch(lines[line_number - 1])
+            if assigned:
+                return line_number, target, assigned.group(1).strip()
+    return None
+
+
 def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dict[str, Any]]:
     """모델은 위치와 표현식만 제안하며 실행 가능 여부는 워커가 검사한다."""
     lines = source.split("\n")
@@ -88,9 +112,10 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
         line, expr = item.line_number, item.target.strip()
         if not 1 <= line <= len(lines) or not _valid_expression(expr, language):
             continue
-        if (line, expr) in seen:
+        identity = (line, re.sub(r"\s+", "", expr))
+        if identity in seen:
             continue
-        seen.add((line, expr))
+        seen.add(identity)
         context_exprs = []
         for candidate in item.context_exprs[:4]:
             candidate = candidate.strip()
@@ -98,6 +123,16 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
                 context_exprs.append(candidate)
         probes.append({"id": len(probes), "line_number": line, "target": expr,
                        "context_exprs": context_exprs})
+    output_assignment = _output_assignment(source, language)
+    if output_assignment:
+        line, target, right_side = output_assignment
+        identity = (line, target)
+        if identity not in seen:
+            context = [right_side] if _valid_expression(right_side, language) else []
+            probes.insert(0, {"line_number": line, "target": target, "context_exprs": context})
+    probes = probes[:MAX_PROBES]
+    for index, probe in enumerate(probes):
+        probe["id"] = index
     return probes
 
 

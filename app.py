@@ -397,7 +397,11 @@ def build_verified_tutorial(
                 delta = 1
             return (delta, -int(event["occurrence"]))
         selected.append(max(changed, key=importance))
-    selected.sort(key=lambda item: int(item.get("event_index", item["line_number"])))
+    # 같은 실행 행의 같은 회차를 별칭·공백만 바꿔 다시 묻지 않는다.
+    unique_events: dict[tuple[int, int], dict[str, Any]] = {}
+    for event in sorted(selected, key=lambda item: len(item.get("context_values", {})), reverse=True):
+        unique_events.setdefault((int(event["line_number"]), int(event["occurrence"])), event)
+    selected = sorted(unique_events.values(), key=lambda item: int(item.get("event_index", item["line_number"])))
 
     steps: list[TraceStep] = []
     for event in selected[:6]:

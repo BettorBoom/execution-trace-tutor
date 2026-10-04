@@ -64,6 +64,21 @@ class VerifiedTraceTests(unittest.TestCase):
         with self.assertRaises(TutorialError):
             validate_tutorial(broken, "C", POINTER_SOURCE)
 
+    def test_same_line_same_execution_is_asked_once(self):
+        probes = [
+            {"id": 0, "line_number": 4, "target": "*(*arr + i)"},
+            {"id": 1, "line_number": 4, "target": "*(*arr+i)"},
+        ]
+        observations = [
+            {"id": 0, "line_number": 4, "target": "*(*arr + i)", "occurrence": 3,
+             "before": "4", "after": "1", "event_index": 3, "context_values": {"i": "2"}},
+            {"id": 1, "line_number": 4, "target": "*(*arr+i)", "occurrence": 3,
+             "before": "4", "after": "1", "event_index": 4, "context_values": {}},
+        ]
+        tutorial = build_verified_tutorial("C", POINTER_SOURCE, probes, observations, "1")
+        self.assertEqual([(step.line_number, step.answer) for step in tutorial.steps], [(4, "1"), (14, "1")])
+        self.assertIn("i=2", tutorial.steps[0].question)
+
     def test_old_model_answers_are_not_graded(self):
         page = AppTest.from_string(
             "from app import initialize_state, show_study_view\n"

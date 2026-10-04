@@ -170,6 +170,31 @@ class TutorialTests(unittest.TestCase):
             {"id": 0, "line_number": 3, "target": "x", "context_exprs": []},
         ])
 
+    def test_equivalent_pointer_probes_deduplicate_and_output_dependency_is_included(self):
+        plan = ProbePlan.model_validate({"probes": [
+            {"line_number": 4, "target": "*(*arr + i)", "reason": "배열 변경"},
+            {"line_number": 4, "target": "*(*arr+i)", "reason": "같은 배열 변경"},
+        ]})
+        probes = validate_probe_plan(plan, POINTER_SOURCE, "C")
+        self.assertEqual([(item["line_number"], item["target"]) for item in probes], [
+            (13, "num"), (4, "*(*arr + i)"),
+        ])
+        self.assertEqual(probes[0]["context_exprs"], ["arr[2]"])
+        self.assertEqual([item["id"] for item in probes], [0, 1])
+
+    def test_output_dependency_fallback_covers_other_languages(self):
+        samples = (
+            ("C++", "int main(){\nint x=1;\nx=x+2;\nstd::cout << x;\n}", 3),
+            ("Java", "class Demo {\nstatic void main(String[] a){\nint x=1;\nx=x+2;\nSystem.out.print(x);\n}\n}", 4),
+            ("Python", "x=1\nx=x+2\nprint(x)", 2),
+        )
+        for language, source, line in samples:
+            with self.subTest(language=language):
+                plan = ProbePlan.model_validate({"probes": []})
+                self.assertEqual(validate_probe_plan(plan, source, language), [
+                    {"id": 0, "line_number": line, "target": "x", "context_exprs": ["x+2"]},
+                ])
+
     def test_raw_json_fallback_builds_step_numbers(self):
         plan = {"probes": [{"line_number": 2, "target": "x", "reason": "값 변화"}]}
         response = SimpleNamespace(
