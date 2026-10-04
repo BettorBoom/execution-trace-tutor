@@ -114,6 +114,7 @@ class Tutorial(BaseModel):
     annotated_code: str
     schema_version: int = 1
     line_notes: list[LineNote] = Field(default_factory=list)
+    excluded_steps: int = 0
 
 
 class TutorialError(Exception):
@@ -319,6 +320,8 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
         raise TutorialError("모델 응답의 언어 또는 단계가 올바르지 않습니다. 다시 생성해 주세요.")
     if len(tutorial.steps) > 7 and tutorial.schema_version >= QUIZ_SCHEMA_VERSION:
         raise TutorialError("문항이 7개를 초과했습니다. 다시 생성해 주세요.")
+    if type(tutorial.excluded_steps) is not int or not 0 <= tutorial.excluded_steps <= 6:
+        raise TutorialError("제외된 문항 수가 올바르지 않습니다.")
     for expected_number, step in enumerate(tutorial.steps, start=1):
         if step.step_number != expected_number:
             raise TutorialError("내부 단계 번호 검증에 실패했습니다. 앱을 다시 실행해 주세요.")
@@ -377,6 +380,52 @@ def output_lines(source: str, language: str) -> set[int]:
     }
 
 
+def build_trace_step(step: GeneratedTraceStep, lines: list[str], number: int) -> TraceStep:
+    """한 문항의 정답·상태·선택지를 대조하고 실제 질문 대상을 확정한다."""
+    if not 1 <= step.line_number <= len(lines):
+        raise GenerationValidationError(number, "줄 번호가 원본 코드 밖에 있음")
+    if not all(value.strip() for value in (step.target, step.answer, step.hint, step.explanation)):
+        raise GenerationValidationError(number, "질문 맥락·정답·설명에 빈 값이 있음")
+    target = step.target.strip()
+    if step.question_kind == "value_after":
+        matching = [
+            change for change in step.changes
+            if normalize_answer(change.after) == normalize_answer(step.answer)
+        ]
+        if not matching:
+            raise GenerationValidationError(number, "정답과 모든 실행 후 값이 다름")
+        # 모델의 자유 형식 target보다, 같은 정답을 가진 구조화된 값 변화의 대상을 사용한다.
+        selected = next((change for change in matching if change.target.strip() == target), matching[0])
+        target = selected.target.strip()
+        if (
+            selected.before.lstrip("-").isdigit()
+            and selected.after.lstrip("-").isdigit()
+            and selected.before != selected.after
+            and (selected.before not in step.explanation or selected.after not in step.explanation)
+        ):
+            raise GenerationValidationError(number, "해설에 값 변화가 빠짐")
+    check_calculations(step.changes, number)
+    if len(step.distractors) != 2:
+        raise ChoiceValidationError(number, "오답 후보 개수가 2개가 아님")
+    choices = [step.answer, *step.distractors]
+    check_choices(choices, number, step.answer, step.question_kind)
+    random.SystemRandom().shuffle(choices)
+    return TraceStep(
+        line_number=step.line_number,
+        question=question_for(step.question_kind, step.line_number, target, step.context),
+        choices=choices,
+        answer=step.answer,
+        hint=step.hint,
+        explanation=step.explanation,
+        step_number=number,
+        code_line=lines[step.line_number - 1],
+        question_kind=step.question_kind,
+        target=target,
+        context=step.context,
+        changes=step.changes,
+    )
+
+
 def finalize_generated_tutorial(
     payload: dict[str, Any], language: str, source: str, problem: str = ""
 ) -> Tutorial:
@@ -393,48 +442,30 @@ def finalize_generated_tutorial(
     if sum(bool(line.strip()) for line in lines) > 4 and not generated.line_notes:
         raise GenerationValidationError(1, "핵심 행별 메모가 없음")
     steps = []
+    prints = output_lines(source, language) if re.search(r"출력|output", problem, re.I) else set()
+    excluded = 0
     seen_questions: set[tuple[int, str, str, str]] = set()
     for number, step in enumerate(generated.steps, start=1):
-        if not 1 <= step.line_number <= len(lines):
-            raise GenerationValidationError(number, "줄 번호가 원본 코드 밖에 있음")
-        if not all(value.strip() for value in (step.target, step.answer, step.hint, step.explanation)):
-            raise GenerationValidationError(number, "질문 맥락·정답·설명에 빈 값이 있음")
-        identity = (step.line_number, step.question_kind, step.target.strip(), step.context.strip())
-        if identity in seen_questions:
-            raise GenerationValidationError(number, "같은 시점의 질문이 중복됨")
-        seen_questions.add(identity)
-        if step.question_kind == "value_after" and not step.changes:
-            raise GenerationValidationError(number, "값 변화 설명이 없음")
-        if step.question_kind == "value_after" and not any(
-            item.target.strip() == step.target.strip()
-            and normalize_answer(item.after) == normalize_answer(step.answer)
-            for item in step.changes
-        ):
-            raise GenerationValidationError(number, "정답과 대상 변수의 실행 후 값이 다름")
-        check_calculations(step.changes, number)
-        if len(step.distractors) != 2:
-            raise ChoiceValidationError(number, "오답 후보 개수가 2개가 아님")
-        choices = [step.answer, *step.distractors]
-        check_choices(choices, number, step.answer, step.question_kind)
-        random.SystemRandom().shuffle(choices)
-        steps.append(
-            TraceStep(
-                line_number=step.line_number,
-                question=question_for(step.question_kind, step.line_number, step.target, step.context),
-                choices=choices,
-                answer=step.answer,
-                hint=step.hint,
-                explanation=step.explanation,
-                step_number=number,
-                code_line=lines[step.line_number - 1],
-                question_kind=step.question_kind,
-                target=step.target,
-                context=step.context,
-                changes=step.changes,
+        try:
+            candidate = build_trace_step(step, lines, number)
+            identity = (
+                candidate.line_number, candidate.question_kind,
+                candidate.target, candidate.context.strip(),
             )
-        )
-    if re.search(r"출력|output", problem, re.I):
-        prints = output_lines(source, language)
+            if identity in seen_questions:
+                raise GenerationValidationError(number, "같은 시점의 질문이 중복됨")
+        except GenerationValidationError as exc:
+            if not prints or step.question_kind != "value_after":
+                raise
+            excluded += 1
+            LOGGER.warning("불일치 보조 문항 제외: %s", json.dumps(exc.diagnostics, ensure_ascii=False))
+            continue
+        seen_questions.add(identity)
+        candidate.step_number = len(steps) + 1
+        steps.append(candidate)
+    if not steps:
+        raise GenerationValidationError(0, "검증을 통과한 문항이 없음")
+    if prints:
         if prints and not any(
             step.question_kind == "diagnostic"
             or (step.question_kind in ("output_this_step", "output_so_far") and step.line_number in prints)
@@ -448,6 +479,7 @@ def finalize_generated_tutorial(
             annotated_code=review_code(source, language, generated.line_notes, steps),
             schema_version=QUIZ_SCHEMA_VERSION,
             line_notes=generated.line_notes,
+            excluded_steps=excluded,
         ).model_dump(),
         language,
         source,
@@ -928,6 +960,8 @@ def show_study_view() -> None:
     st.write(f"**문제:** {st.session_state['study_problem']}")
     st.write(f"**언어:** {language}")
     st.caption(f"학습 형식 v{quiz.get('schema_version', 1)}")
+    if quiz.get("excluded_steps"):
+        st.caption(f"값·정답이 맞지 않는 보조 문항 {quiz['excluded_steps']}개를 제외했습니다.")
     if quiz.get("schema_version", 1) < QUIZ_SCHEMA_VERSION:
         st.warning("기존 방식으로 만든 문제입니다. 새 값 변화 설명을 적용하려면 아래 버튼으로 새 문제를 준비하세요.")
         if st.button("이 코드로 새 형식 생성 준비"):

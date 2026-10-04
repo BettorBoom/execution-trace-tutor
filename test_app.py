@@ -242,7 +242,14 @@ class TutorialTests(unittest.TestCase):
         generated["steps"][0]["answer"] = "2"
         with self.assertRaises(TutorialError) as raised:
             finalize_generated_tutorial(generated, "C", SOURCE)
-        self.assertEqual(raised.exception.diagnostics["reason"], "정답과 대상 변수의 실행 후 값이 다름")
+        self.assertEqual(raised.exception.diagnostics["reason"], "정답과 모든 실행 후 값이 다름")
+
+    def test_value_question_uses_matching_state_target(self):
+        generated = generated_payload()
+        generated["steps"][0]["target"] = "x의 값"
+        result = finalize_generated_tutorial(generated, "C", SOURCE)
+        self.assertEqual(result.steps[0].target, "x")
+        self.assertIn("`x`의 값", result.steps[0].question)
 
     def test_numeric_aliases_and_repeated_questions_are_rejected(self):
         generated = generated_payload()
@@ -365,6 +372,14 @@ class TutorialTests(unittest.TestCase):
         result = finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
         self.assertEqual(result.steps[-1].line_number, 14)
         self.assertEqual(result.steps[-1].answer, "1")
+
+        generated["steps"][0]["answer"] = "2"
+        with self.assertLogs("execution_trace_tutor", level="WARNING"):
+            filtered = finalize_generated_tutorial(generated, "C", POINTER_SOURCE, "출력값은?")
+        self.assertEqual(len(filtered.steps), 1)
+        self.assertEqual(filtered.steps[0].step_number, 1)
+        self.assertEqual(filtered.steps[0].question_kind, "output_this_step")
+        self.assertEqual(filtered.excluded_steps, 1)
 
     def test_raw_json_fallback_builds_step_numbers(self):
         response = SimpleNamespace(

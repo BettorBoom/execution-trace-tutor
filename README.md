@@ -2,7 +2,7 @@
 
 C, C++, Java, Python 코드를 분석해 **최대 7개 핵심 3지선다 문항**을 만듭니다. Google 로그인 후 각자의 OpenAI API 키를 한 번 등록하면 PC와 휴대전화에서 문제를 이어 풀고 복습할 수 있습니다. 사용자의 코드를 실행하지 않고 모델이 분석합니다.
 
-새 학습 형식(v2)은 모델이 제시한 정답·오답·값 변화·간단한 정수 계산을 앱에서 대조합니다. 정답이나 패스 뒤에는 현재 행을 유지하며 **맞았습니다! / 패스했습니다**, 정답, 값 변화와 해설을 표시하고, 사용자가 **다음 문제**를 눌러야 이동합니다. 생성 작업은 백그라운드에서 실행되므로 대기 중에도 화면을 사용할 수 있습니다. 모델 출력이 잘못되면 한 번만 자동 재생성합니다. 기존 보관함의 문제는 그대로 열 수 있지만 새 검증을 거친 것으로 표시하지 않으며, 원본 코드로 새 형식을 다시 생성할 수 있습니다.
+새 학습 형식(v2)은 모델이 제시한 정답·오답·값 변화·간단한 정수 계산을 앱에서 대조합니다. 정답이나 패스 뒤에는 현재 행을 유지하며 **맞았습니다! / 패스했습니다**, 정답, 값 변화와 해설을 표시하고, 사용자가 **다음 문제**를 눌러야 이동합니다. 생성 작업은 백그라운드에서 실행되므로 대기 중에도 화면을 사용할 수 있습니다. 출력값 문제에서는 출력 문항을 반드시 포함하고, 불일치한 보조 문항은 제외하며 제외 개수를 표시합니다. 여전히 유효한 핵심 문항이 없으면 한 번만 자동 재생성합니다. 기존 보관함의 문제는 그대로 열 수 있지만 새 검증을 거친 것으로 표시하지 않으며, 원본 코드로 새 형식을 다시 생성할 수 있습니다.
 
 ## 필요한 서비스 설정
 
@@ -27,9 +27,11 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 
 ## Streamlit Community Cloud 배포
 
-현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. 저장소 소유자가 바뀌었으므로, 예전 `theBettor` 저장소에 연결된 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)은 새 코드를 자동으로 배포하지 않을 수 있습니다. [Community Cloud 대시보드](https://share.streamlit.io)에서 새 앱을 만들고 `BettorBoom/execution-trace-tutor`, `main`, `app.py`를 지정하세요. 새 앱이 정상 동작하는 것을 확인한 뒤 기존 앱을 정리하거나, 가능하다면 기존 주소를 새 앱에 배정하세요.
+현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. GitHub 계정명을 `theBettor`에서 `BettorBoom`으로 바꾼 뒤 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)의 관리 화면에는 예전 경로가 표시되지만, **Manage app → ⋮ → Reboot app**으로 재부팅하면 GitHub 리디렉션을 통해 최신 `main` 코드를 다시 가져오는 것을 확인했습니다. 이 방식은 기존 주소·Secrets·Google 로그인 콜백을 유지합니다. 이름 변경 후 자동 배포 웹훅은 검증되지 않았으므로, 코드를 올린 뒤 화면의 `앱 버전 2`와 새 기능을 확인하고 갱신되지 않았다면 재부팅하세요.
 
-새 앱의 **⋮ → Settings → Secrets**에 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)의 항목을 입력합니다. `redirect_uri`에는 **새 앱의 실제 주소** 뒤에 `/oauth2callback`을 붙인 값을 넣고, Google Cloud의 승인된 리디렉션 URI에도 똑같은 값을 추가합니다. `cookie_secret`은 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. Supabase URL·서버 키, **기존과 동일한** 암호화 키, Google 클라이언트 값이 모두 필요합니다. 특히 암호화 키를 바꾸면 기존에 저장된 개인 API 키를 읽을 수 없습니다. 문의 메일은 기본값 `be0128st@gmail.com`이며 Secrets의 `CONTACT_EMAIL`로 변경할 수 있습니다.
+나중에 새 GitHub 경로로 Cloud 앱을 다시 만들려면 [Community Cloud 대시보드](https://share.streamlit.io)에서 `BettorBoom/execution-trace-tutor`, `main`, `app.py`를 지정합니다. 이 경우 새 주소에 맞춰 Secrets와 Google 로그인 콜백을 다시 설정해야 합니다.
+
+새 앱으로 옮길 때만 **⋮ → Settings → Secrets**에 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)의 항목을 입력합니다. `redirect_uri`에는 **새 앱의 실제 주소** 뒤에 `/oauth2callback`을 붙인 값을 넣고, Google Cloud의 승인된 리디렉션 URI에도 똑같은 값을 추가합니다. `cookie_secret`은 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. Supabase URL·서버 키, **기존과 동일한** 암호화 키, Google 클라이언트 값이 모두 필요합니다. 특히 암호화 키를 바꾸면 기존에 저장된 개인 API 키를 읽을 수 없습니다. 문의 메일은 기본값 `be0128st@gmail.com`이며 Secrets의 `CONTACT_EMAIL`로 변경할 수 있습니다.
 
 배포 후 화면 상단의 `앱 버전 2` 표시를 확인합니다. Google 로그인을 누르고, 사이드바에 자신의 OpenAI API 키를 등록한 다음 예제 코드를 생성·풀이·새로고침해 보관함 복원을 확인합니다. **실제 API 키·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
 
