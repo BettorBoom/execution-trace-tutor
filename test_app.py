@@ -1,12 +1,16 @@
 """API 키 없이 실행 가능한 핵심 동작 검증."""
 
 import json
+import runpy
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 from openai import AuthenticationError, BadRequestError, InternalServerError, RateLimitError
+from pydantic import PydanticUserError
 import httpx2
 
 from app import (
@@ -25,6 +29,8 @@ from app import (
     validate_tutorial,
     contact_html,
     build_verified_tutorial,
+    Tutorial,
+    TraceStep,
 )
 from verified_trace import ProbePlan, validate_probe_plan
 
@@ -113,6 +119,30 @@ class TutorialTests(unittest.TestCase):
         for text in ("", "```json\n{broken}\n```", "[]"):
             with self.assertRaises(TutorialError):
                 parse_json_object(text)
+
+    def test_tutorial_schema_survives_streamlit_style_reexecution_in_worker_thread(self):
+        runtime = runpy.run_path(str(Path(__file__).with_name("app.py")), run_name="streamlit_script_test")
+        tutorial_class = runtime["Tutorial"]
+        self.assertEqual(tutorial_class.__annotations__["steps"], list[runtime["TraceStep"]])
+        self.assertTrue(tutorial_class.__pydantic_complete__)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            tutorial = executor.submit(tutorial_class.model_validate, payload()).result(timeout=5)
+        self.assertEqual(tutorial.steps[0].answer, "1")
+        self.assertEqual(Tutorial.__annotations__["steps"], list[TraceStep])
+
+    def test_local_pydantic_failure_is_not_reported_as_openai_failure(self):
+        response = SimpleNamespace(
+            output_parsed=ProbePlan.model_validate({"probes": []}), status="completed",
+        )
+        with patch("app.OpenAI") as client_class, patch(
+            "app.validate_probe_plan",
+            side_effect=PydanticUserError("TraceStep 참조 실패", code="class-not-fully-defined"),
+        ):
+            client_class.return_value.responses.parse.return_value = response
+            with self.assertRaises(TutorialError) as raised:
+                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
+        self.assertIn("앱 내부 오류", str(raised.exception))
+        self.assertEqual(raised.exception.diagnostics, {"error_type": "PydanticUserError"})
 
     def test_openai_structured_response(self):
         response = SimpleNamespace(

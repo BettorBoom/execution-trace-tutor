@@ -1,7 +1,5 @@
 """격리 실행으로 확인한 값으로 코드 흐름을 학습하는 Streamlit 앱."""
 
-from __future__ import annotations
-
 import json
 import logging
 import os
@@ -556,6 +554,13 @@ def generate_tutorial(
             model=model, input=plan_prompt(language, problem, source),
             text_format=ProbePlan, store=False,
         )
+    except Exception as exc:
+        diagnostics = api_error_diagnostics(exc, api_key, model)
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 1)
+        LOGGER.error("OpenAI 요청 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
+        raise TutorialError(describe_api_error(exc), diagnostics) from None
+
+    try:
         if response.status == "incomplete":
             raise TutorialError("OpenAI 응답이 중간에 끊겼습니다. 코드를 줄여 다시 생성해 주세요.")
         try:
@@ -574,10 +579,12 @@ def generate_tutorial(
     except TraceError as exc:
         raise TutorialError(str(exc)) from None
     except Exception as exc:
-        diagnostics = api_error_diagnostics(exc, api_key, model)
-        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 1)
-        LOGGER.error("OpenAI 요청 실패: %s", json.dumps(diagnostics, ensure_ascii=False))
-        raise TutorialError(describe_api_error(exc), diagnostics) from None
+        # 모델 파싱·격리 실행·문항 조립 오류는 API 장애로 잘못 안내하지 않는다.
+        LOGGER.error("튜토리얼 조립 오류: %s", type(exc).__name__)
+        raise TutorialError(
+            "앱 내부 오류로 튜토리얼을 만들지 못했습니다. 개발자에게 문의해 주세요.",
+            {"error_type": type(exc).__name__},
+        ) from None
 
 
 def run_generation_job(
