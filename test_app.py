@@ -19,6 +19,7 @@ from app import (
     acknowledge_result,
     advance_step,
     api_error_diagnostics,
+    archive_time,
     describe_api_error,
     generate_tutorial,
     highlight_source,
@@ -153,7 +154,8 @@ class TutorialTests(unittest.TestCase):
         )
         observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
             "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
-        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed) as sandbox:
+        with patch("app.MIN_NEW_STEPS", 1), patch("app.OpenAI") as client_class, \
+             patch("app.run_isolated_trace", return_value=observed) as sandbox:
             client_class.return_value.responses.parse.return_value = response
             tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
             request = client_class.return_value.responses.parse.call_args.kwargs
@@ -174,6 +176,21 @@ class TutorialTests(unittest.TestCase):
         schema = json.dumps(ProbePlan.model_json_schema())
         self.assertNotIn('"minItems"', schema)
         self.assertNotIn('"maxItems"', schema)
+
+    def test_generation_rejects_fewer_than_three_verified_steps(self):
+        response = SimpleNamespace(
+            output_parsed=ProbePlan.model_validate({"probes": [
+                {"line_number": 2, "target": "x", "reason": "값 변화"}
+            ]}), status="completed",
+        )
+        observed = {"stdout": "", "observations": [{
+            "id": 0, "line_number": 2, "target": "x", "occurrence": 1,
+            "before": "0", "after": "1", "event_index": 1,
+        }]}
+        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed):
+            client_class.return_value.responses.parse.return_value = response
+            with self.assertRaisesRegex(TutorialError, "3문항"):
+                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
 
     def test_malformed_json_fails_before_sandbox(self):
         malformed = SimpleNamespace(output_parsed=None, status="completed", output_text="{broken")
@@ -219,7 +236,7 @@ class TutorialTests(unittest.TestCase):
         ]})
         self.assertEqual(validate_probe_plan(plan, source, "C"), [
             {"id": 0, "line_number": 4, "target": "mines[y][x]",
-             "context_exprs": ["mines[y][x] + x + y"]},
+             "context_exprs": ["y", "x", "mines[y][x] + x + y"]},
         ])
 
     def test_output_dependency_fallback_covers_other_languages(self):
@@ -235,6 +252,28 @@ class TutorialTests(unittest.TestCase):
                     {"id": 0, "line_number": line, "target": "x", "context_exprs": ["x+2"]},
                 ])
 
+    def test_sparse_model_plan_adds_another_nonconstant_assignment(self):
+        source = (
+            '#include <stdio.h>\nint main(){\n int x=1,y=0;\n'
+            ' x=x+2;\n y=x*2;\n printf("%d",x+y);\n}'
+        )
+        plan = ProbePlan.model_validate({"probes": [
+            {"line_number": 4, "target": "x", "reason": "변화"}
+        ]})
+        probes = validate_probe_plan(plan, source, "C")
+        self.assertEqual([(item["line_number"], item["target"]) for item in probes],
+                         [(4, "x"), (5, "y")])
+
+    def test_extra_model_probe_suggestions_do_not_fail_generation(self):
+        source = "int main(){\n int x=0;\n" + " x=x+1;\n" * 7 + "}"
+        plan = ProbePlan.model_validate({"probes": [
+            {"line_number": line, "target": "x", "reason": "값 변화"}
+            for line in range(3, 10)
+        ]})
+        probes = validate_probe_plan(plan, source, "C")
+        self.assertEqual(len(probes), 6)
+        self.assertEqual([item["line_number"] for item in probes], list(range(3, 9)))
+
     def test_raw_json_fallback_builds_step_numbers(self):
         plan = {"probes": [{"line_number": 2, "target": "x", "reason": "값 변화"}]}
         response = SimpleNamespace(
@@ -244,7 +283,8 @@ class TutorialTests(unittest.TestCase):
         )
         observed = {"stdout": "", "observations": [{"id": 0, "line_number": 2, "target": "x",
             "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
-        with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed):
+        with patch("app.MIN_NEW_STEPS", 1), patch("app.OpenAI") as client_class, \
+             patch("app.run_isolated_trace", return_value=observed):
             client_class.return_value.responses.parse.return_value = response
             tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
         self.assertEqual(tutorial.steps[0].step_number, 1)
@@ -337,6 +377,8 @@ class TutorialTests(unittest.TestCase):
         self.assertFalse(acknowledge_result(state))
 
     def test_answer_format_and_highlight(self):
+        self.assertEqual(archive_time("2026-10-04T10:27:00+00:00"), "2026-10-04 19:27 KST")
+        self.assertEqual(archive_time("2026-10-04T10:27:00Z"), "2026-10-04 19:27 KST")
         self.assertEqual(normalize_answer(" a\r\nb \n"), "a\nb")
         self.assertNotEqual(normalize_answer("A"), normalize_answer("a"))
         self.assertNotEqual(normalize_answer("a b"), normalize_answer("ab"))
@@ -426,7 +468,7 @@ class TutorialTests(unittest.TestCase):
             "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
         with patch("app.google_owner", return_value="google:test"), patch("app.make_store", return_value=store), \
              patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")), \
-             patch("app.run_isolated_trace", return_value=observed):
+             patch("app.run_isolated_trace", return_value=observed), patch("app.MIN_NEW_STEPS", 1):
             app = AppTest.from_string("import app\napp.main()").run(timeout=15)
             app.text_area[0].set_value("x의 값은?")
             app.text_area[1].set_value(SOURCE)

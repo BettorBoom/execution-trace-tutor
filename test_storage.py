@@ -253,7 +253,8 @@ class StorageTests(unittest.TestCase):
             "occurrence": 1, "before": "0", "after": "1", "event_index": 1}]}
         with patch("app.google_owner", return_value="google:a"), patch("app.make_store", return_value=self.store), \
              patch("app.setting", side_effect=lambda name: VERIFIED_SETTINGS.get(name, "")), \
-             patch("app.run_isolated_trace", return_value=observed), patch("app.OpenAI") as client_class:
+             patch("app.run_isolated_trace", return_value=observed), patch("app.OpenAI") as client_class, \
+             patch("app.MIN_NEW_STEPS", 1):
             client_class.return_value.responses.parse.return_value = Namespace(output_parsed=parsed, status="completed")
             page = AppTest.from_string("import app\napp.main()").run(timeout=15)
             page.text_area[0].set_value("x의 값")

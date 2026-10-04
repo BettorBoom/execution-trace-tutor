@@ -41,6 +41,7 @@ def plan_prompt(language: str, problem: str, source: str) -> str:
     return f"""아래 {language} 코드를 공부할 핵심 지점을 최대 6개 고르세요.
 정답 값이나 해설은 만들지 마세요. 실제 실행으로 확인할 읽기 전용 표현식만 제안하세요.
 최종 출력, 포인터/참조/배열, 함수 부수 효과, 분기와 반복의 핵심 변화를 우선하세요.
+서로 다른 값 변화가 있다면 대입문을 최소 2개 제안하세요. 한 줄만 반복 실행돼도 회차별 값이 달라지는 지점을 고르세요.
 단순 상수 초기화, 중복 질문, 단독 중괄호, 주석은 제외하세요.
 같은 실행 행의 같은 값을 공백이나 표기만 달리해 두 번 제안하지 마세요.
 각 probe의 line_number는 실행 직후 값을 볼 단일 행 대입문의 물리적 줄 번호입니다.
@@ -127,8 +128,6 @@ def _assigned_target(source: str, line_number: int, language: str) -> tuple[str,
 def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dict[str, Any]]:
     """모델은 위치와 표현식만 제안하며 실행 가능 여부는 워커가 검사한다."""
     lines = source.split("\n")
-    if len(plan.probes) > MAX_PROBES:
-        raise TraceError("핵심 지점이 6개를 초과했습니다. 다시 생성해 주세요.")
     probes: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     for item in plan.probes:
@@ -143,17 +142,21 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
         if identity in seen:
             continue
         seen.add(identity)
-        context_exprs = []
+        # 배열 원소를 묻는 문항은 실제 인덱스가 보여야 같은 줄의 반복 실행을 구분할 수 있다.
+        context_exprs = list(dict.fromkeys(re.findall(r"\[([A-Za-z_]\w*)\]", expr)))[:4]
         for candidate in item.context_exprs[:4]:
             candidate = candidate.strip()
-            if candidate != expr and candidate not in context_exprs and _valid_expression(candidate, language):
+            if (len(context_exprs) < 4 and candidate != expr and candidate not in context_exprs
+                    and _valid_expression(candidate, language)):
                 context_exprs.append(candidate)
         if (assigned and re.sub(r"\s+", "", model_target) == re.sub(r"\s+", "", assigned[1])
                 and not any(re.sub(r"\s+", "", value) == re.sub(r"\s+", "", model_target)
                             for value in context_exprs)):
-            context_exprs = [model_target, *context_exprs][:4]
+            context_exprs = [*context_exprs, model_target][:4]
         probes.append({"id": len(probes), "line_number": line, "target": expr,
                        "context_exprs": context_exprs})
+        if len(probes) >= MAX_PROBES:
+            break
     output_assignment = _output_assignment(source, language)
     if output_assignment:
         line, target, right_side = output_assignment
@@ -161,6 +164,22 @@ def validate_probe_plan(plan: ProbePlan, source: str, language: str) -> list[dic
         if identity not in seen:
             context = [right_side] if _valid_expression(right_side, language) else []
             probes.insert(0, {"line_number": line, "target": target, "context_exprs": context})
+            seen.add(identity)
+    # 모델이 한 줄만 고른 경우에는 다른 비상수 대입문 하나를 보강한다.
+    if len(probes) < 2:
+        for line in range(len(lines), 0, -1):
+            assigned = _assigned_target(source, line, language)
+            if not assigned or re.fullmatch(r"[+-]?\d+", assigned[1]):
+                continue
+            target, right_side = assigned
+            identity = (line, re.sub(r"\s+", "", target))
+            if identity in seen:
+                continue
+            context = list(dict.fromkeys(re.findall(r"\[([A-Za-z_]\w*)\]", target)))[:4]
+            if len(context) < 4 and right_side != target and _valid_expression(right_side, language):
+                context.append(right_side)
+            probes.append({"line_number": line, "target": target, "context_exprs": context})
+            break
     probes = probes[:MAX_PROBES]
     for index, probe in enumerate(probes):
         probe["id"] = index

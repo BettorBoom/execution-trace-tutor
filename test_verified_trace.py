@@ -17,6 +17,25 @@ from storage import new_tutorial_record
 
 
 class VerifiedTraceTests(unittest.TestCase):
+    def test_three_questions_from_repeated_changes_in_four_languages(self):
+        samples = [
+            ("C", '#include <stdio.h>\nint main(){\n int x=0;\n for(int i=0;i<3;i++){\n  x=x+i+1;\n }\n printf("%d",x);\n}', 5, ("gcc",)),
+            ("C++", '#include <iostream>\nint main(){\n int x=0;\n for(int i=0;i<3;i++){\n  x=x+i+1;\n }\n std::cout<<x;\n}', 5, ("g++",)),
+            ("Java", 'class Demo {\n public static void main(String[] a){\n int x=0;\n for(int i=0;i<3;i++){\n  x=x+i+1;\n }\n System.out.print(x);\n }\n}', 5, ("javac", "java")),
+            ("Python", 'x=0\nfor i in range(3):\n    x=x+i+1\nprint(x)', 3, ()),
+        ]
+        for language, source, line, commands in samples:
+            if any(not shutil.which(command) for command in commands):
+                continue
+            with self.subTest(language=language):
+                probes = [{"id": 0, "line_number": line, "target": "x", "context_exprs": ["i"]}]
+                result = verify({"language": language, "source": source, "probes": probes})
+                tutorial = build_verified_tutorial(
+                    language, source, probes, result["observations"], result["stdout"]
+                )
+                self.assertEqual([step.answer for step in tutorial.steps], ["1", "6", "6"])
+                self.assertEqual([step.verified_fact["occurrence"] for step in tutorial.steps[:2]], [1, 3])
+
     def test_four_languages_use_observed_value_and_output(self):
         samples = [
             ("C", "#include <stdio.h>\nint main(){\n int x=1;\n x=x+2;\n printf(\"%d\",x);\n}", 4, ("gcc",)),
@@ -75,6 +94,28 @@ class VerifiedTraceTests(unittest.TestCase):
         with self.assertRaises(TutorialError):
             validate_tutorial(broken, "C", POINTER_SOURCE)
 
+    @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
+    def test_repeated_array_update_yields_three_distinct_questions(self):
+        source = (
+            "#include <stdio.h>\nint main(void){\n"
+            " int w=3,h=2,x,y;\n int mines[2][3]={{0,1,0},{1,0,0}};\n"
+            " for(y=0;y<h;y++){\n  for(x=0;x<w;x++)\n"
+            "   mines[y][x]=mines[y][x]+x+y;\n }\n"
+            " for(y=0;y<h;y++){\n  for(x=0;x<w;x++)\n"
+            "   printf(\"%d\",mines[y][x]);\n  printf(\"\\n\");\n }\n}"
+        )
+        probes = [{"id": 0, "line_number": 7, "target": "mines[y][x]",
+                   "context_exprs": ["x", "y", "mines[y][x]+x+y"]}]
+        result = verify({"language": "C", "source": source, "probes": probes})
+        tutorial = build_verified_tutorial("C", source, probes, result["observations"], result["stdout"])
+        self.assertEqual(len(tutorial.steps), 3)
+        self.assertEqual([step.verified_fact["occurrence"] for step in tutorial.steps[:2]], [2, 6])
+        self.assertEqual([step.answer for step in tutorial.steps[:2]], ["2", "3"])
+        self.assertEqual(tutorial.steps[-1].answer, '"022\\n223\\n"')
+        self.assertEqual(set(tutorial.steps[-1].choices), {
+            '"022\\n223\\n"', '"022\\n222\\n"', '"022\\n224\\n"',
+        })
+
     def test_same_line_same_execution_is_asked_once(self):
         probes = [
             {"id": 0, "line_number": 4, "target": "*(*arr + i)"},
@@ -89,6 +130,18 @@ class VerifiedTraceTests(unittest.TestCase):
         tutorial = build_verified_tutorial("C", POINTER_SOURCE, probes, observations, "1")
         self.assertEqual([(step.line_number, step.answer) for step in tutorial.steps], [(4, "1"), (14, "1")])
         self.assertIn("i=2", tutorial.steps[0].question)
+
+    def test_repeated_line_prefers_distinct_value_change(self):
+        source = "a=[0,0,1]\nfor i in range(3):\n    a[i]=a[i]+1\nprint(a[2])"
+        probes = [{"id": 0, "line_number": 3, "target": "a[i]"}]
+        observations = [
+            {"id": 0, "line_number": 3, "target": "a[i]", "occurrence": n,
+             "before": before, "after": after, "event_index": n,
+             "context_values": {"i": str(n - 1)}}
+            for n, before, after in ((1, "0", "1"), (2, "0", "1"), (3, "1", "2"))
+        ]
+        tutorial = build_verified_tutorial("Python", source, probes, observations, "2\n")
+        self.assertEqual([step.verified_fact["occurrence"] for step in tutorial.steps[:2]], [1, 3])
 
     def test_old_model_answers_are_not_graded(self):
         page = AppTest.from_string(

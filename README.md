@@ -1,8 +1,8 @@
 # 다국어 실행 추적 튜터
 
-C, C++, Java, Python 코드에서 **최대 7개 핵심 3지선다 문항**을 만듭니다. Google 로그인 후 각자의 OpenAI API 키를 등록하면 PC와 휴대전화에서 이어 풀고 복습할 수 있습니다. OpenAI가 확인할 행·표현식을 제안하고, 앱은 중복을 제거하고 단순 출력 변수의 마지막 대입을 보강합니다. 정답과 숫자 설명은 [Modal Sandbox](https://modal.com/docs/guide/sandboxes)에서 실제 코드를 실행해 관측한 값으로 만듭니다. 제출 코드는 OpenAI와 Modal로 전송됩니다.
+C, C++, Java, Python 코드에서 **3~7개 핵심 3지선다 문항**을 만듭니다. Google 로그인 후 각자의 OpenAI API 키를 등록하면 PC와 휴대전화에서 이어 풀고 복습할 수 있습니다. OpenAI가 확인할 행·표현식을 제안하고, 앱은 중복을 제거하고 단순 출력 변수의 마지막 대입을 보강합니다. 반복문의 서로 다른 값 변화도 학습 지점으로 고르며, 비상수 대입문이 빠졌다면 하나를 보강합니다. 정답과 숫자 설명은 [Modal Sandbox](https://modal.com/docs/guide/sandboxes)에서 실제 코드를 실행해 관측한 값으로 만듭니다. 제출 코드는 OpenAI와 Modal로 전송됩니다.
 
-학습 형식 v4는 원본을 두 번 실행해 결과가 일정한지 확인하고, 값 질문은 읽기 전용 식을 대입문 전후에 관측합니다. 관측 코드를 넣은 실행의 출력이 원본 출력과 다르면 해당 값 질문을 버립니다. 제어문 본문을 보존하고 재귀 호출별 전후 값을 짝지으며, 한 관측 지점이 실패해도 다른 유효한 지점은 따로 확인합니다. 모델이 만든 숫자·정답·오답은 사용하지 않습니다. 정답이나 패스 뒤에는 현재 행에서 **맞았습니다! / 패스했습니다**, 관측값과 해설을 보여주고 **다음 문제**를 눌러 이동합니다. v1·v2·v3 보관 기록은 원본과 복습용으로 열 수 있지만 검증 전 정답의 채점은 중단합니다. 새 문제 생성은 1회 OpenAI 호출과 격리 실행이 필요합니다.
+학습 형식 v4는 원본을 두 번 실행해 결과가 일정한지 확인하고, 값 질문은 읽기 전용 식을 대입문 전후에 관측합니다. 관측 코드를 넣은 실행의 출력이 원본 출력과 다르면 해당 값 질문을 버립니다. 제어문 본문을 보존하고 재귀 호출별 전후 값을 짝지으며, 한 관측 지점이 실패해도 다른 유효한 지점은 따로 확인합니다. 모델이 만든 숫자·정답·오답은 사용하지 않습니다. 정답이나 패스 뒤에는 현재 행에서 **맞았습니다! / 패스했습니다**, 관측값과 해설을 보여주고 **다음 문제**를 눌러 이동합니다. 검증 가능한 값 변화가 3문항을 채우지 못하면 중복·가짜 문제를 만들지 않고 생성 실패 이유를 안내합니다. 기존 1~2문항 보관 기록은 그대로 열립니다. v1·v2·v3 보관 기록은 원본과 복습용으로 열 수 있지만 검증 전 정답의 채점은 중단합니다. 새 문제 생성은 1회 OpenAI 호출과 격리 실행이 필요합니다.
 
 ## 필요한 서비스 설정
 
@@ -28,13 +28,13 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 
 ## Streamlit Community Cloud 배포
 
-현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. GitHub 계정명을 `theBettor`에서 `BettorBoom`으로 바꾼 뒤 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)의 관리 화면에는 예전 경로가 표시되지만, **Manage app → ⋮ → Reboot app**으로 재부팅하면 GitHub 리디렉션을 통해 최신 `main` 코드를 다시 가져오는 것을 확인했습니다. 이 방식은 기존 주소·Secrets·Google 로그인 콜백을 유지합니다. 이름 변경 후 자동 배포 웹훅은 검증되지 않았으므로, 코드를 올린 뒤 화면의 `앱 버전 4.4 · 실행 검증`과 새 기능을 확인하고 갱신되지 않았다면 재부팅하세요.
+현재 GitHub 저장소는 [BettorBoom/execution-trace-tutor](https://github.com/BettorBoom/execution-trace-tutor)입니다. GitHub 계정명을 `theBettor`에서 `BettorBoom`으로 바꾼 뒤 [기존 Streamlit 앱](https://execution-trace-tutor-isldmuvfxksbizyhpjcihb.streamlit.app/)의 관리 화면에는 예전 경로가 표시되지만, **Manage app → ⋮ → Reboot app**으로 재부팅하면 GitHub 리디렉션을 통해 최신 `main` 코드를 다시 가져오는 것을 확인했습니다. 이 방식은 기존 주소·Secrets·Google 로그인 콜백을 유지합니다. 이름 변경 후 자동 배포 웹훅은 검증되지 않았으므로, 코드를 올린 뒤 화면의 `앱 버전 4.5 · 실행 검증`과 새 기능을 확인하고 갱신되지 않았다면 재부팅하세요.
 
 나중에 새 GitHub 경로로 Cloud 앱을 다시 만들려면 [Community Cloud 대시보드](https://share.streamlit.io)에서 `BettorBoom/execution-trace-tutor`, `main`, `app.py`를 지정합니다. 이 경우 새 주소에 맞춰 Secrets와 Google 로그인 콜백을 다시 설정해야 합니다.
 
 새 앱으로 옮길 때만 **⋮ → Settings → Secrets**에 [.streamlit/secrets.toml.example](.streamlit/secrets.toml.example)의 항목을 입력합니다. `redirect_uri`에는 **새 앱의 실제 주소** 뒤에 `/oauth2callback`을 붙인 값을 넣고, Google Cloud의 승인된 리디렉션 URI에도 똑같은 값을 추가합니다. `cookie_secret`은 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. Supabase URL·서버 키, **기존과 동일한** 암호화 키, Google 클라이언트 값이 모두 필요합니다. 특히 암호화 키를 바꾸면 기존에 저장된 개인 API 키를 읽을 수 없습니다. 문의 메일은 기본값 `be0128st@gmail.com`이며 Secrets의 `CONTACT_EMAIL`로 변경할 수 있습니다.
 
-배포 후 화면 상단의 `앱 버전 4.4 · 실행 검증` 표시를 확인합니다. Google 로그인과 개인 OpenAI 키 등록 후, C 포인터 예제로 4행의 `4→1`, 13행의 `6→1`, 최종 출력 `1`이 표시되는지 확인합니다. **실제 API 키·Modal 토큰·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
+배포 후 화면 상단의 `앱 버전 4.5 · 실행 검증` 표시를 확인합니다. Google 로그인과 개인 OpenAI 키 등록 후, C 포인터 예제로 4행의 `4→1`, 13행의 `6→1`, 최종 출력 `1`이 표시되는지 확인합니다. **실제 API 키·Modal 토큰·데이터베이스 비밀번호·클라이언트 비밀값은 GitHub나 이슈에 게시하지 않습니다.**
 
 Streamlit 인증 앱은 Community Cloud의 비공개 앱 한도에 포함됩니다. Google 로그인은 Streamlit이 처리하고, 사용자의 API 키는 암호화된 형태로 Supabase에 저장됩니다. Supabase 서버용 키와 암호화 키는 공개 저장소에 넣지 마세요.
 

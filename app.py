@@ -8,6 +8,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from html import escape
 from typing import Any, Literal
@@ -41,6 +42,7 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_CONTACT_EMAIL = "be0128st@gmail.com"
 QUIZ_SCHEMA_VERSION = 2
 VERIFIED_SCHEMA_VERSION = 4
+MIN_NEW_STEPS = 3
 LOGGER = logging.getLogger("execution_trace_tutor")
 
 
@@ -359,6 +361,17 @@ def display_output(stdout: str) -> str:
     return json.dumps(stdout, ensure_ascii=False)
 
 
+def archive_time(value: str) -> str:
+    """서버의 UTC 저장 시각을 한국 사용자에게 익숙한 시각으로 표시한다."""
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            return str(value)[:16]
+        return moment.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
+    except (AttributeError, ValueError):
+        return str(value)[:16]
+
+
 def verified_choices(answer: str, numeric: bool) -> list[str]:
     """모델이 정답 선택지를 정하지 못하게 관측값에서 오답을 만든다."""
     if numeric and re.fullmatch(r"-?\d+", answer):
@@ -369,9 +382,20 @@ def verified_choices(answer: str, numeric: bool) -> list[str]:
             literal = json.loads(answer)
         except (ValueError, TypeError):
             literal = None
-        if isinstance(literal, str):
-            choices = [answer, json.dumps(literal + "?", ensure_ascii=False),
-                       json.dumps(literal + "!", ensure_ascii=False)]
+        text_value = literal if isinstance(literal, str) else answer
+        if text_value:
+            match = re.search(r"\d(?!.*\d)", text_value, re.DOTALL)
+            if match:
+                digit = int(match.group())
+                variants = [text_value[:match.start()] + str((digit + offset) % 10) + text_value[match.end():]
+                            for offset in (-1, 1)]
+            elif text_value.endswith("\n"):
+                variants = [text_value[:-1], text_value + "\n"]
+            else:
+                variants = ([text_value[:-1], text_value + text_value[-1]]
+                            if len(text_value) > 1 else [text_value * 2, text_value * 3])
+            encode = (lambda value: json.dumps(value, ensure_ascii=False)) if isinstance(literal, str) else str
+            choices = [answer, *(encode(value) for value in variants)]
         else:
             choices = [answer, answer + "?", answer + "!"]
     random.SystemRandom().shuffle(choices)
@@ -384,6 +408,7 @@ def build_verified_tutorial(
     """모델의 숫자는 받지 않고, 실행 결과만 정답·주석의 근거로 쓴다."""
     lines = source.split("\n")
     selected: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for probe_id, probe in enumerate(probes):
         events = [item for item in observations if item.get("id") == probe_id]
         if not events:
@@ -392,6 +417,7 @@ def build_verified_tutorial(
         changed = [item for item in changed if re.fullmatch(r"-?\d+", str(item.get("after", "")))]
         if not changed:
             continue
+        candidates.extend(changed)
         def importance(event: dict[str, Any]) -> tuple[int, int]:
             try:
                 delta = abs(int(event["after"]) - int(event["before"]))
@@ -403,6 +429,28 @@ def build_verified_tutorial(
     unique_events: dict[tuple[int, int], dict[str, Any]] = {}
     for event in sorted(selected, key=lambda item: len(item.get("context_values", {})), reverse=True):
         unique_events.setdefault((int(event["line_number"]), int(event["occurrence"])), event)
+    # 한 줄이 여러 번 실행됐다면 서로 다른 값 변화·실행 조건을 추가로 묻는다.
+    # 같은 전후 값과 조건을 되풀이하는 회차는 문항 수를 채우려고 복제하지 않는다.
+    needed_values = MIN_NEW_STEPS - bool(stdout)
+    ordered_candidates = sorted(candidates, key=lambda item: int(item.get("event_index", item["line_number"])))
+    for require_new_change in (True, False):
+        for event in ordered_candidates:
+            if len(unique_events) >= needed_values:
+                break
+            identity = (int(event["line_number"]), int(event["occurrence"]))
+            similar = [
+                item for item in unique_events.values()
+                if item["line_number"] == event["line_number"]
+                and item["target"] == event["target"]
+                and item["before"] == event["before"]
+                and item["after"] == event["after"]
+            ]
+            if identity in unique_events or (similar and (
+                require_new_change or any(item.get("context_values", {}) == event.get("context_values", {})
+                                          for item in similar)
+            )):
+                continue
+            unique_events[identity] = event
     selected = sorted(unique_events.values(), key=lambda item: int(item.get("event_index", item["line_number"])))
 
     steps: list[TraceStep] = []
@@ -577,7 +625,13 @@ def generate_tutorial(
             raise TutorialError("모델이 확인할 코드 행을 올바르게 제안하지 못했습니다.") from exc
         probes = validate_probe_plan(plan, source, language)
         observed = run_isolated_trace(language, source, probes, sandbox_settings)
-        return build_verified_tutorial(language, source, probes, observed["observations"], observed["stdout"])
+        tutorial = build_verified_tutorial(language, source, probes, observed["observations"], observed["stdout"])
+        if len(tutorial.steps) < MIN_NEW_STEPS:
+            raise TutorialError(
+                "이 코드에서 서로 다른 실행 변화를 충분히 확인하지 못해 3문항을 만들 수 없습니다. "
+                "값이 바뀌는 대입문이나 반복문이 포함된 코드를 사용해 주세요."
+            )
+        return tutorial
     except TutorialError:
         raise
     except TraceError as exc:
@@ -1173,7 +1227,10 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
         language = st.selectbox("프로그래밍 언어", list(LANGUAGES), key=f"language_input_{owner}")
         problem = st.text_area("문제 설명", placeholder="예: 다음 프로그램의 실행 결과는?", key=f"problem_input_{owner}")
         source = st.text_area("소스 코드", height=260, placeholder="코드를 여기에 붙여 넣으세요.", key=f"source_input_{owner}")
-        st.caption("입력한 코드는 OpenAI에 출제 지점 선별용으로 전송되고, Modal 격리 샌드박스에서 실행됩니다.")
+        st.caption(
+            "입력한 코드는 OpenAI에 출제 지점 선별용으로 전송되고, Modal 격리 샌드박스에서 실행됩니다. "
+            "새 문제는 3~7개이며, 확인 가능한 값 변화가 부족하면 생성할 수 없습니다."
+        )
         requested = st.form_submit_button(
             "핵심 문제 생성", disabled=st.session_state["generation_job"] is not None or not sandbox_ready
         )
@@ -1242,7 +1299,7 @@ def show_archive_view(store: ArchiveStore, owner: str) -> None:
         state_label = "완료" if completed else f"진행 중 ({progress.get('current_step_idx', 0)}/{len(outcomes)})"
         title = summary["problem"].strip().splitlines()[0][:55]
         with st.expander(f"{summary['language']} · {state_label} · {title}"):
-            st.caption(f"마지막 학습: {summary.get('updated_at', '')[:16]}")
+            st.caption(f"마지막 학습: {archive_time(summary.get('updated_at', ''))}")
             if st.button("열기·복습" if completed else "이어 풀기", key=f"open_{record_id}"):
                 try:
                     record = store.get_tutorial(owner, record_id)
@@ -1303,7 +1360,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.4 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.5 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:
