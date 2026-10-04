@@ -9,10 +9,11 @@ from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 
-from app import TutorialError, build_verified_tutorial, validate_tutorial
+from app import TutorialError, apply_record, build_verified_tutorial, validate_tutorial
 from test_app import POINTER_SOURCE, SOURCE, payload
 from trace_worker import verify
 from verified_trace import TraceError, run_isolated_trace
+from storage import new_tutorial_record
 
 
 class VerifiedTraceTests(unittest.TestCase):
@@ -53,6 +54,16 @@ class VerifiedTraceTests(unittest.TestCase):
         self.assertIn("실행 직전 i=2", tutorial.steps[0].question)
         self.assertIn("`size` = 5", tutorial.steps[0].explanation)
         self.assertEqual(result["stdout"], "1")
+
+        # Supabase JSONB가 context_values 키 순서를 바꿔도 저장본을 열 수 있어야 한다.
+        stored = json.loads(json.dumps(tutorial.model_dump(), sort_keys=True))
+        restored = validate_tutorial(stored, "C", POINTER_SOURCE)
+        self.assertEqual([step.answer for step in restored.steps], ["1", "1", "1"])
+        record = new_tutorial_record("출력값", "C", POINTER_SOURCE, "gpt-4.1-mini", stored)
+        record["owner_id"] = "google:test"
+        state = {"owner_id": "google:test", "generation_count": 0}
+        apply_record(state, record)
+        self.assertIn("4 → 1", state["quiz_data"]["annotated_code"])
 
         broken = tutorial.model_dump()
         broken["steps"][0]["answer"] = "0"

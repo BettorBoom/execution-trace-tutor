@@ -242,7 +242,7 @@ def review_code(source: str, language: str, notes: list[LineNote], steps: list[T
                 context_values = step.verified_fact.get("context_values", {})
                 if context_values:
                     detail += "; " + ", ".join(
-                        f"{expression}={value}" for expression, value in context_values.items()
+                        f"{expression}={value}" for expression, value in sorted(context_values.items())
                     )
             all_notes.append((
                 step.line_number,
@@ -309,7 +309,11 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
         for note in tutorial.line_notes:
             if not 1 <= note.line_number <= len(lines) or not note.note.strip():
                 raise TutorialError("행별 주석의 위치나 설명이 올바르지 않습니다. 다시 생성해 주세요.")
-        if tutorial.annotated_code != review_code(source, language, tutorial.line_notes, tutorial.steps):
+        reviewed = review_code(source, language, tutorial.line_notes, tutorial.steps)
+        if tutorial.execution_verified:
+            # JSONB는 객체 키 순서를 바꿀 수 있다. 주석은 검증된 사실에서 다시 만든다.
+            tutorial.annotated_code = reviewed
+        elif tutorial.annotated_code != reviewed:
             raise TutorialError("저장된 주석 코드가 원본 실행 정보와 다릅니다.")
     if tutorial.schema_version >= VERIFIED_SCHEMA_VERSION:
         if not tutorial.execution_verified:
@@ -1299,7 +1303,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.2 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.3 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:
