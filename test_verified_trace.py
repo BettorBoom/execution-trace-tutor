@@ -52,9 +52,11 @@ class VerifiedTraceTests(unittest.TestCase):
                 tutorial = build_verified_tutorial(
                     language, source, probes, result["observations"], result["stdout"]
                 )
-                self.assertEqual([step.answer for step in tutorial.steps], ["3", "3"])
-                self.assertEqual(tutorial.steps[0].changes[0].before, "1")
-                self.assertEqual(tutorial.steps[0].verified_fact["after"], "3")
+                self.assertEqual([step.answer for step in tutorial.steps], ["1", "3", "3"])
+                self.assertEqual([step.question_kind for step in tutorial.steps],
+                                 ["value_before", "value_after", "program_output"])
+                self.assertEqual(tutorial.steps[1].changes[0].before, "1")
+                self.assertEqual(tutorial.steps[1].verified_fact["after"], "3")
                 self.assertEqual(tutorial.schema_version, 4)
 
     @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
@@ -128,8 +130,9 @@ class VerifiedTraceTests(unittest.TestCase):
              "before": "4", "after": "1", "event_index": 4, "context_values": {}},
         ]
         tutorial = build_verified_tutorial("C", POINTER_SOURCE, probes, observations, "1")
-        self.assertEqual([(step.line_number, step.answer) for step in tutorial.steps], [(4, "1"), (14, "1")])
-        self.assertIn("i=2", tutorial.steps[0].question)
+        self.assertEqual([(step.line_number, step.answer) for step in tutorial.steps],
+                         [(4, "4"), (4, "1"), (14, "1")])
+        self.assertIn("i=2", tutorial.steps[1].question)
 
     def test_repeated_line_prefers_distinct_value_change(self):
         source = "a=[0,0,1]\nfor i in range(3):\n    a[i]=a[i]+1\nprint(a[2])"

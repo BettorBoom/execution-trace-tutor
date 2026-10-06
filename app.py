@@ -162,7 +162,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
 def choice_identity(value: str, question_kind: str) -> str | Decimal:
     """값 질문에서 1, 01, 1.0처럼 같은 수인 선택지를 구분하지 않는다."""
     normalized = normalize_answer(value)
-    if question_kind == "value_after" and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", normalized):
+    if question_kind in ("value_before", "value_after") and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", normalized):
         try:
             return Decimal(normalized)
         except InvalidOperation:
@@ -197,6 +197,14 @@ def question_for(kind: str, line_number: int, target: str, context: str) -> str:
     prefix = f"{context.strip()} — " if context.strip() else ""
     if kind == "value_after":
         return f"{prefix}{line_number}행 실행 직후 `{target}`의 값은 무엇인가요? 선택지에서 값 하나를 고르세요."
+    if kind == "value_before":
+        return f"{prefix}{line_number}행 실행 직전 `{target}`의 값은 무엇인가요? 선택지에서 값 하나를 고르세요."
+    if kind == "output_character":
+        return f"{prefix}{line_number}행에서 `{target}`의 출력 문자는 무엇인가요?"
+    if kind == "output_length":
+        return "프로그램이 출력한 글자는 모두 몇 개인가요? 줄바꿈도 한 글자로 셉니다."
+    if kind == "normal_exit":
+        return "격리 실행에서 이 프로그램은 어떻게 종료했나요?"
     if kind == "output_this_step":
         return f"{prefix}{line_number}행의 `{target}`가 이번에 출력하는 내용은 무엇인가요?"
     if kind == "output_so_far":
@@ -252,6 +260,8 @@ def review_code(source: str, language: str, notes: list[LineNote], steps: list[T
             ))
         if step.question_kind == "program_output" and step.verified_fact:
             all_notes.append((step.line_number, f"검증된 최종 표준 출력: {step.answer}"))
+        if step.question_kind == "output_character" and step.verified_fact:
+            all_notes.append((step.line_number, f"{step.target}: {step.answer} 출력"))
     comments = [
         f"{marker} {line_number}행: {note.replace(chr(10), ' ').replace(chr(13), ' ')}"
         for line_number, note in all_notes
@@ -287,7 +297,7 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
             raise TutorialError("모델 응답에 빈 질문이나 답변이 있습니다. 다시 생성해 주세요.")
         check_choices(step.choices, expected_number, step.answer, step.question_kind)
         if tutorial.schema_version >= QUIZ_SCHEMA_VERSION:
-            if not step.target.strip() or (step.question_kind == "value_after" and not step.changes):
+            if not step.target.strip() or (step.question_kind in ("value_before", "value_after") and not step.changes):
                 raise TutorialError("실행 시점 또는 값 변화 설명이 빠졌습니다. 다시 생성해 주세요.")
             if step.question != question_for(step.question_kind, step.line_number, step.target, step.context):
                 raise TutorialError("저장된 질문 문장이 실행 정보와 다릅니다.")
@@ -322,13 +332,28 @@ def validate_tutorial(payload: dict[str, Any], language: str, source: str) -> Tu
             raise TutorialError("실행 검증 정보가 없는 문제는 채점할 수 없습니다.")
         for step in tutorial.steps:
             fact = step.verified_fact or {}
-            if step.question_kind == "value_after":
+            if step.question_kind in ("value_before", "value_after"):
                 if (fact.get("source") != "probe" or fact.get("line_number") != step.line_number
-                    or fact.get("target") != step.target or fact.get("after") != step.answer):
+                    or fact.get("target") != step.target
+                    or fact.get("before" if step.question_kind == "value_before" else "after") != step.answer):
                     raise TutorialError("정답과 실행 관측값이 다릅니다.")
                 change = next(item for item in step.changes if item.target.strip() == step.target.strip())
                 if fact.get("before") != change.before or fact.get("after") != change.after:
                     raise TutorialError("값 변화 설명과 실행 관측값이 다릅니다.")
+            elif step.question_kind == "output_character":
+                index = fact.get("index")
+                if (fact.get("source") != "stdout_char" or type(index) is not int
+                    or not 0 <= index < len(tutorial.stdout)
+                    or fact.get("line_number") != step.line_number
+                    or tutorial.stdout[index] != step.answer):
+                    raise TutorialError("출력 문자와 실행 관측값이 다릅니다.")
+            elif step.question_kind == "output_length":
+                if (fact.get("source") != "stdout_length" or fact.get("line_number") != step.line_number
+                    or step.answer != str(len(tutorial.stdout))):
+                    raise TutorialError("출력 길이와 실행 관측값이 다릅니다.")
+            elif step.question_kind == "normal_exit":
+                if fact.get("source") != "execution" or fact.get("status") != "ok" or step.answer != "정상 종료":
+                    raise TutorialError("실행 종료 상태가 올바르지 않습니다.")
             elif step.question_kind == "program_output":
                 if fact.get("source") != "stdout" or step.answer != display_output(tutorial.stdout):
                     raise TutorialError("정답과 실제 출력이 다릅니다.")
@@ -354,6 +379,8 @@ def output_lines(source: str, language: str) -> set[int]:
 
 def display_output(stdout: str) -> str:
     """터미널의 관례적인 마지막 개행만 화면에서 생략한다."""
+    if not stdout:
+        return "(출력 없음)"
     if stdout.endswith("\n") and stdout.count("\n") == 1 and stdout[:-1].strip() == stdout[:-1]:
         return stdout[:-1]
     if stdout and "\n" not in stdout and stdout.strip() == stdout:
@@ -385,7 +412,12 @@ def verified_choices(answer: str, numeric: bool) -> list[str]:
         text_value = literal if isinstance(literal, str) else answer
         if text_value:
             match = re.search(r"\d(?!.*\d)", text_value, re.DOTALL)
-            if match:
+            if len(text_value) == 1 and text_value.isascii() and text_value.isalpha():
+                first = ord("A" if text_value.isupper() else "a")
+                offset = ord(text_value) - first
+                shifts = (1, 2) if offset == 0 else ((-2, -1) if offset == 25 else (-1, 1))
+                variants = [chr(ord(text_value) + shift) for shift in shifts]
+            elif match:
                 digit = int(match.group())
                 variants = [text_value[:match.start()] + str((digit + offset) % 10) + text_value[match.end():]
                             for offset in (-1, 1)]
@@ -492,15 +524,16 @@ def build_verified_tutorial(
         ))
 
     printed_lines = output_lines(source, language)
-    if stdout:
-        line_number = max(printed_lines) if printed_lines else max(
-            number for number, line in enumerate(lines, 1) if line.strip()
-        )
-        answer = display_output(stdout)
+    line_number = max(printed_lines) if printed_lines else next(
+        (number for number in range(len(lines), 0, -1) if lines[number - 1].strip()), 1
+    )
+    answer = display_output(stdout)
+    if stdout or len(steps) < MIN_NEW_STEPS:
         steps.append(TraceStep(
             line_number=line_number,
             question=question_for("program_output", line_number, "표준 출력", ""),
-            choices=verified_choices(answer, numeric=bool(re.fullmatch(r"-?\d+", answer))),
+            choices=(verified_choices(answer, numeric=bool(re.fullmatch(r"-?\d+", answer)))
+                     if stdout else ["(출력 없음)", "0", "빈 줄 1개"]),
             answer=answer,
             hint="이전 행의 값 변화를 반영해 최종 출력을 확인해 보세요.",
             explanation=f"격리 환경에서 원본 코드를 실행해 확인한 표준 출력은 {answer}입니다.",
@@ -508,10 +541,80 @@ def build_verified_tutorial(
             question_kind="program_output", target="표준 출력", context="",
             verified_fact={"source": "stdout", "line_number": line_number},
         ))
-    if not steps:
-        raise TutorialError(
-            "실행으로 확인된 출제 지점이 없습니다. 출력문 또는 단일 행 대입문이 있는 코드를 사용해 주세요."
-        )
+    # 문항이 부족하면 같은 답을 복제하지 않고 실행 직전 값과 출력 문자를 묻는다.
+    for step in list(steps):
+        if len(steps) >= MIN_NEW_STEPS:
+            break
+        if step.question_kind != "value_after":
+            continue
+        fact = step.verified_fact or {}
+        before = str(fact.get("before", ""))
+        if not re.fullmatch(r"-?\d+", before):
+            continue
+        steps.insert(steps.index(step), TraceStep(
+            line_number=step.line_number,
+            question=question_for("value_before", step.line_number, step.target, step.context),
+            choices=verified_choices(before, numeric=True), answer=before,
+            hint=f"이 행을 실행하면 `{step.target}`의 값은 {step.answer}가 됩니다. 대입 전 값을 찾아보세요.",
+            explanation=f"{step.line_number}행의 {step.context} 전에 `{step.target}`은 {before}이고, 실행 후 {step.answer}로 바뀝니다.",
+            step_number=0, code_line=step.code_line, question_kind="value_before",
+            target=step.target, context=step.context, changes=step.changes,
+            verified_fact=fact,
+        ))
+    if len(steps) < MIN_NEW_STEPS and stdout:
+        # 정확히 두 번의 %c 출력이면 화면에 실제 포인터 표현식을 보여 준다.
+        char_args = None
+        if language == "C" and len(stdout) == 2 and printed_lines == {line_number}:
+            char_args = re.fullmatch(
+                r'\s*printf\s*\(\s*"%c%c"\s*,\s*([^,]+?)\s*,\s*([^,]+?)\s*\)\s*;\s*',
+                lines[line_number - 1],
+            )
+        for index, character in enumerate(stdout):
+            if len(steps) >= MIN_NEW_STEPS or not character.isprintable() or character.isspace():
+                continue
+            target = char_args.group(index + 1).strip() if char_args and index < 2 else f"표준 출력의 {index + 1}번째 문자"
+            context = f"{index + 1}번째 %c" if char_args and index < 2 else ""
+            pointer_move = re.fullmatch(r"\*\(\s*([A-Za-z_]\w*)\s*([+-])\s*(\d+)\s*\)", target)
+            explanation = f"격리 실행에서 {index + 1}번째로 출력된 문자는 {character}입니다."
+            if pointer_move:
+                direction = "오른쪽" if pointer_move.group(2) == "+" else "왼쪽"
+                explanation = (
+                    f"`{pointer_move.group(1)}`가 가리키는 위치에서 {pointer_move.group(3)}칸 "
+                    f"{direction}의 문자를 읽습니다. 실제 출력 문자는 {character}입니다."
+                )
+            steps.insert(-1, TraceStep(
+                line_number=line_number,
+                question=question_for("output_character", line_number, target, context),
+                choices=verified_choices(character, numeric=False), answer=character,
+                hint="이 출력문의 인자를 순서대로 따라가 보세요." if char_args else "실제 출력의 문자 순서를 확인해 보세요.",
+                explanation=explanation,
+                step_number=0, code_line=lines[line_number - 1],
+                question_kind="output_character", target=target, context=context,
+                verified_fact={"source": "stdout_char", "index": index, "line_number": line_number},
+            ))
+    if len(steps) < MIN_NEW_STEPS:
+        count = len(stdout)
+        choices = [str(count), str(count + 1), str(count + 2)]
+        random.SystemRandom().shuffle(choices)
+        steps.insert(-1, TraceStep(
+            line_number=line_number, question=question_for("output_length", line_number, "표준 출력", ""),
+            choices=choices, answer=str(count),
+            hint="화면에 보이지 않는 줄바꿈도 출력된 글자에 포함합니다.",
+            explanation=f"격리 실행의 표준 출력은 줄바꿈을 포함해 {count}글자입니다.",
+            step_number=0, code_line=lines[line_number - 1], question_kind="output_length",
+            target="표준 출력", verified_fact={"source": "stdout_length", "line_number": line_number},
+        ))
+    if len(steps) < MIN_NEW_STEPS:
+        steps.insert(-1, TraceStep(
+            line_number=line_number, question=question_for("normal_exit", line_number, "실행", ""),
+            choices=["정상 종료", "실행 오류", "컴파일 오류"], answer="정상 종료",
+            hint="원본 코드의 격리 실행 결과를 확인해 보세요.",
+            explanation="격리 실행에서 원본 코드가 오류 없이 정상 종료했습니다.",
+            step_number=0, code_line=lines[line_number - 1], question_kind="normal_exit",
+            target="실행", verified_fact={"source": "execution", "status": "ok"},
+        ))
+    for number, step in enumerate(steps, 1):
+        step.step_number = number
     tutorial = Tutorial(
         language=language, steps=steps, annotated_code=review_code(source, language, [], steps),
         schema_version=VERIFIED_SCHEMA_VERSION,
@@ -626,11 +729,6 @@ def generate_tutorial(
         probes = validate_probe_plan(plan, source, language)
         observed = run_isolated_trace(language, source, probes, sandbox_settings)
         tutorial = build_verified_tutorial(language, source, probes, observed["observations"], observed["stdout"])
-        if len(tutorial.steps) < MIN_NEW_STEPS:
-            raise TutorialError(
-                "이 코드에서 서로 다른 실행 변화를 충분히 확인하지 못해 3문항을 만들 수 없습니다. "
-                "값이 바뀌는 대입문이나 반복문이 포함된 코드를 사용해 주세요."
-            )
         return tutorial
     except TutorialError:
         raise
@@ -1229,7 +1327,7 @@ def show_generate_view(store: ArchiveStore, owner: str, model: str) -> None:
         source = st.text_area("소스 코드", height=260, placeholder="코드를 여기에 붙여 넣으세요.", key=f"source_input_{owner}")
         st.caption(
             "입력한 코드는 OpenAI에 출제 지점 선별용으로 전송되고, Modal 격리 샌드박스에서 실행됩니다. "
-            "새 문제는 3~7개이며, 확인 가능한 값 변화가 부족하면 생성할 수 없습니다."
+            "정상 실행이 확인된 코드에서 3~7문항을 만듭니다."
         )
         requested = st.form_submit_button(
             "핵심 문제 생성", disabled=st.session_state["generation_job"] is not None or not sandbox_ready
@@ -1360,7 +1458,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.5 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.6 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:

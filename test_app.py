@@ -54,6 +54,13 @@ int main(){
     printf("%d", num);
     return 0;
 }"""
+CHAR_POINTER_SOURCE = """#include <stdio.h>
+int main() {
+    char text[6] = {'A', 'B', 'C', 'D', 'E', '\\0'};
+    char *start = text + 1;
+    printf("%c%c", *(start + 2), *(start - 1));
+    return 0;
+}"""
 STEP = {
     "step_number": 1,
     "line_number": 2,
@@ -82,7 +89,9 @@ def verified_payload(two_steps=False):
         probes.append({"id": 1, "line_number": 3, "target": "x"})
         observations.append({"id": 1, "line_number": 3, "target": "x", "occurrence": 1,
                              "before": "1", "after": "2", "event_index": 2})
-    return build_verified_tutorial("C", SOURCE, probes, observations, "").model_dump()
+    # 기존 보관함에 남아 있을 수 있는 1~2단계 기록도 계속 열 수 있는지 검사한다.
+    with patch("app.MIN_NEW_STEPS", 1):
+        return build_verified_tutorial("C", SOURCE, probes, observations, "").model_dump()
 
 
 def finish_generation(page):
@@ -177,7 +186,7 @@ class TutorialTests(unittest.TestCase):
         self.assertNotIn('"minItems"', schema)
         self.assertNotIn('"maxItems"', schema)
 
-    def test_generation_rejects_fewer_than_three_verified_steps(self):
+    def test_generation_expands_one_observed_change_to_three_verified_steps(self):
         response = SimpleNamespace(
             output_parsed=ProbePlan.model_validate({"probes": [
                 {"line_number": 2, "target": "x", "reason": "값 변화"}
@@ -189,8 +198,43 @@ class TutorialTests(unittest.TestCase):
         }]}
         with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace", return_value=observed):
             client_class.return_value.responses.parse.return_value = response
-            with self.assertRaisesRegex(TutorialError, "3문항"):
-                generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
+            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "x의 값", SOURCE, VERIFIED_SETTINGS)
+        self.assertEqual(len(tutorial.steps), 3)
+        self.assertEqual([step.question_kind for step in tutorial.steps],
+                         ["value_before", "value_after", "program_output"])
+        self.assertEqual([step.answer for step in tutorial.steps], ["0", "1", "(출력 없음)"])
+
+    def test_character_pointer_output_produces_three_grounded_questions(self):
+        response = SimpleNamespace(
+            output_parsed=ProbePlan.model_validate({"probes": []}), status="completed",
+        )
+        with patch("app.OpenAI") as client_class, patch(
+            "app.run_isolated_trace", return_value={"stdout": "DA", "observations": []}
+        ):
+            client_class.return_value.responses.parse.return_value = response
+            tutorial = generate_tutorial("test-key", "gpt-4.1-mini", "C", "출력 결과", CHAR_POINTER_SOURCE, VERIFIED_SETTINGS)
+        self.assertEqual([step.answer for step in tutorial.steps], ["D", "A", "DA"])
+        self.assertEqual([step.question_kind for step in tutorial.steps],
+                         ["output_character", "output_character", "program_output"])
+        self.assertIn("*(start + 2)", tutorial.steps[0].question)
+        self.assertIn("*(start - 1)", tutorial.steps[1].question)
+        self.assertIn("2칸 오른쪽", tutorial.steps[0].explanation)
+        self.assertIn("1칸 왼쪽", tutorial.steps[1].explanation)
+        self.assertEqual(set(tutorial.steps[0].choices), {"C", "D", "E"})
+        self.assertEqual([step.step_number for step in tutorial.steps], [1, 2, 3])
+        self.assertEqual(validate_tutorial(tutorial.model_dump(), "C", CHAR_POINTER_SOURCE).steps[0].answer, "D")
+        corrupted = tutorial.model_dump()
+        corrupted["steps"][0]["answer"] = "C"
+        with self.assertRaises(TutorialError):
+            validate_tutorial(corrupted, "C", CHAR_POINTER_SOURCE)
+
+    def test_one_character_and_empty_output_still_produce_three_questions(self):
+        for stdout, source in (("X\n", "print('X')"), ("", "pass")):
+            with self.subTest(stdout=stdout):
+                tutorial = build_verified_tutorial("Python", source, [], [], stdout)
+                self.assertEqual(len(tutorial.steps), 3)
+                self.assertEqual(tutorial.steps[-1].question_kind, "program_output")
+                self.assertTrue(all(len(step.choices) == 3 for step in tutorial.steps))
 
     def test_malformed_json_fails_before_sandbox(self):
         malformed = SimpleNamespace(output_parsed=None, status="completed", output_text="{broken")
