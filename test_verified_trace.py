@@ -49,7 +49,7 @@ int main(void) {
         self.assertIn("`if` 조건이 참", tutorial.steps[0].explanation)
         self.assertIn("0 → 5", tutorial.steps[0].explanation)
         self.assertIn("max_div 13 → 29", tutorial.annotated_code)
-        self.assertIn("if 조건이 참이어서 대입 실행", tutorial.annotated_code)
+        self.assertIn("조건이 참이 된 1번째 대입 실행", tutorial.annotated_code)
         self.assertEqual(validate_tutorial(tutorial.model_dump(), "C", source).steps[-1].answer, "29")
 
     def test_three_questions_from_repeated_changes_in_four_languages(self):

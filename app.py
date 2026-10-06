@@ -246,13 +246,10 @@ def check_calculations(changes: list[StateChange], step_number: int) -> None:
 def review_code(source: str, language: str, notes: list[LineNote], steps: list[TraceStep]) -> str:
     """원본 뒤에 행별 메모를 붙여 문자열·전처리기 내용을 보존한다."""
     marker = "#" if language == "Python" else "//"
-    lines = source.split("\n")
     all_notes = [(item.line_number, item.note) for item in notes]
     for step in steps:
         for change in step.changes:
             detail = f"{step.context}: {change.target} {change.before} → {change.after}"
-            if step.verified_fact and _inline_if_assignment(lines[step.line_number - 1]):
-                detail += "; 이 회차에는 if 조건이 참이어서 대입 실행"
             if step.verified_fact:
                 context_values = step.verified_fact.get("context_values", {})
                 if context_values:
