@@ -51,6 +51,23 @@ int main(void) {
                 self.assertEqual(values, [(1, 1, "2"), (2, 1, "3"), (2, 2, "4"), (3, 1, "6")])
                 self.assertEqual(result["stdout"], "done")
 
+    @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
+    def test_inline_if_probe_only_runs_in_taken_branch_and_preserves_else(self):
+        source = '''#include <stdio.h>
+int main(void) {
+ int x=0;
+ if (0) x=1;
+ else x=2;
+ if (1) x=3;
+ printf("%d", x);
+}'''
+        probes = [{"id": 0, "line_number": 4, "target": "x"},
+                  {"id": 1, "line_number": 6, "target": "x"}]
+        result = verify({"language": "C", "source": source, "probes": probes})
+        self.assertEqual(result["stdout"], "3")
+        self.assertEqual([(event["id"], event["before"], event["after"])
+                          for event in result["observations"]], [(1, "2", "3")])
+
     def test_recursive_observations_pair_same_invocation(self):
         source = '''def f(n):
     if n == 0:

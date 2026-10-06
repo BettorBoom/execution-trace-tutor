@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from trace_worker import _assignment_line_is_safe, _python_line_is_safe
+from trace_worker import _assignment_line_is_safe, _inline_if_assignment, _python_line_is_safe
 
 
 MAX_SOURCE_BYTES = 24_000
@@ -46,6 +46,7 @@ def plan_prompt(language: str, problem: str, source: str) -> str:
 같은 실행 행의 같은 값을 공백이나 표기만 달리해 두 번 제안하지 마세요.
 각 probe의 line_number는 실행 직후 값을 볼 단일 행 대입문의 물리적 줄 번호입니다.
 target은 그 행의 대입문 왼쪽 대상인 정수 변수/배열 원소/역참조 표현식입니다.
+`if (조건) max_div = i;`처럼 조건문과 단일 대입문이 같은 행에 있어도 대입 대상을 제안하세요.
 오른쪽 계산식 자체를 target으로 제안하지 마세요. 계산식은 context_exprs에 넣으세요.
 실행 직전에도 이미 선언되고 초기화되어 있는 대상만 고르세요.
 int x=3, int* p=arr, int** pp=&p 같은 선언문은 제외하세요. 포인터 주소 자체도 대상이 아닙니다.
@@ -98,9 +99,12 @@ def _output_assignment(source: str, language: str) -> tuple[int, str, str] | Non
         suffix = "" if language == "Python" else ";"
         assignment = re.compile(rf"^\s*{re.escape(target)}\s*(?:[+*/%-]?=(?!=))\s*(.+?){suffix}\s*$")
         for line_number in range(output_line - 1, 0, -1):
-            assigned = assignment.fullmatch(lines[line_number - 1])
-            if assigned:
-                return line_number, target, assigned.group(1).strip()
+            direct = assignment.fullmatch(lines[line_number - 1])
+            if direct:
+                return line_number, target, direct.group(1).strip()
+            assigned = _assigned_target(source, line_number, language)
+            if assigned and assigned[0] == target and _inline_if_assignment(lines[line_number - 1]):
+                return line_number, target, assigned[1]
     return None
 
 
@@ -116,12 +120,14 @@ def _assigned_target(source: str, line_number: int, language: str) -> tuple[str,
             return None
         left, right = ast.unparse(targets[0]), ast.unparse(node.value)
     else:
-        if not _assignment_line_is_safe(code):
+        inline = _inline_if_assignment(code)
+        assignment_code = inline[1] if inline else code
+        if not _assignment_line_is_safe(assignment_code):
             return None
-        operator = re.search(r"(?<![=!<>])(?:[+*/%&|^-]|<<|>>)?=(?!=)", code)
+        operator = re.search(r"(?<![=!<>])(?:[+*/%&|^-]|<<|>>)?=(?!=)", assignment_code)
         if operator is None:
             return None
-        left, right = code[:operator.start()].strip(), code[operator.end():].rstrip(";").strip()
+        left, right = assignment_code[:operator.start()].strip(), assignment_code[operator.end():].rstrip(";").strip()
     return (left, right) if _valid_expression(left, language) else None
 
 

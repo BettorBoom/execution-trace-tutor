@@ -103,6 +103,21 @@ def _assignment_line_is_safe(code: str) -> bool:
     ))
 
 
+def _inline_if_assignment(code: str) -> tuple[str, str] | None:
+    """한 줄 if의 단일 대입문만 찾아 조건이 참일 때의 값 변화를 관측한다."""
+    code = code.strip()
+    start = re.match(r"if\s*\(", code)
+    if not start:
+        return None
+    depth = 1
+    for index in range(start.end(), len(code)):
+        depth += (code[index] == "(") - (code[index] == ")")
+        if depth == 0:
+            statement = code[index + 1:].strip()
+            return (code[:index + 1], statement) if _assignment_line_is_safe(statement) else None
+    return None
+
+
 def _probe_statement(language: str, probe_id: int, phase: str, target: str) -> str:
     label = f"{TRACE_MARK}{probe_id}:{phase}:"
     if language == "Python":
@@ -135,7 +150,7 @@ def _instrument(source: str, language: str, probes: list[dict]) -> str:
         if language == "Python":
             eligible = _python_line_is_safe(source, number)
         else:
-            eligible = _assignment_line_is_safe(code)
+            eligible = _assignment_line_is_safe(code) or _inline_if_assignment(code) is not None
         if eligible:
             grouped.setdefault(number, []).append(probe)
     if not grouped:
@@ -144,15 +159,19 @@ def _instrument(source: str, language: str, probes: list[dict]) -> str:
     for number, line in enumerate(lines, 1):
         selected = grouped.get(number, [])
         indent = re.match(r"\s*", line).group(0)
-        if selected and language != "Python":
+        inline = _inline_if_assignment(line) if selected and language != "Python" else None
+        if inline:
+            pieces.append(indent + inline[0] + " {")
+        elif selected and language != "Python":
             pieces.append(indent + "{")
+        probe_indent = indent + ("    " if inline else "")
         for probe in selected:
-            pieces.append(indent + _probe_statement(language, probe["id"], "before", probe["target"]))
+            pieces.append(probe_indent + _probe_statement(language, probe["id"], "before", probe["target"]))
             for context_index, expr in enumerate(probe.get("context_exprs", [])):
-                pieces.append(indent + _probe_statement(language, probe["id"], f"context{context_index}", expr))
-        pieces.append(line)
+                pieces.append(probe_indent + _probe_statement(language, probe["id"], f"context{context_index}", expr))
+        pieces.append(probe_indent + inline[1] if inline else line)
         for probe in selected:
-            pieces.append(indent + _probe_statement(language, probe["id"], "after", probe["target"]))
+            pieces.append(probe_indent + _probe_statement(language, probe["id"], "after", probe["target"]))
         if selected and language != "Python":
             pieces.append(indent + "}")
     result = "\n".join(pieces)

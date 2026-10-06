@@ -465,7 +465,13 @@ def build_verified_tutorial(
         unique_events.setdefault((int(event["line_number"]), int(event["occurrence"])), event)
     # 한 줄이 여러 번 실행됐다면 서로 다른 값 변화·실행 조건을 추가로 묻는다.
     # 같은 전후 값과 조건을 되풀이하는 회차는 문항 수를 채우려고 복제하지 않는다.
-    needed_values = MIN_NEW_STEPS - bool(stdout)
+    # 조건이 참일 때만 갱신되는 값은 각 갱신이 학습의 핵심일 수 있다.
+    conditional_changes = {
+        (item["line_number"], item["target"], item["before"], item["after"])
+        for item in candidates
+        if re.match(r"\s*if\s*\(", lines[int(item["line_number"]) - 1])
+    }
+    needed_values = min(6, max(MIN_NEW_STEPS - bool(stdout), min(4, len(conditional_changes))))
     ordered_candidates = sorted(candidates, key=lambda item: int(item.get("event_index", item["line_number"])))
     for require_new_change in (True, False):
         for event in ordered_candidates:
@@ -1460,7 +1466,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.6 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.7 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:

@@ -12,11 +12,41 @@ from streamlit.testing.v1 import AppTest
 from app import TutorialError, apply_record, build_verified_tutorial, validate_tutorial
 from test_app import POINTER_SOURCE, SOURCE, payload
 from trace_worker import verify
-from verified_trace import TraceError, run_isolated_trace
+from verified_trace import ProbePlan, TraceError, run_isolated_trace, validate_probe_plan
 from storage import new_tutorial_record
 
 
 class VerifiedTraceTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
+    def test_prime_factor_inline_if_asks_each_verified_update(self):
+        source = '''#include <stdio.h>
+int isPrime(int number) {
+ int i;
+ for (i = 2; i < number; i++) {
+  if (number % i == 0) return 0;
+ }
+ return 1;
+}
+int main(void) {
+ int number = 13195, max_div = 0, i;
+ for (i = 2; i < number; i++)
+  if (isPrime(i) == 1 && number % i == 0) max_div = i;
+ printf("%d", max_div);
+ return 0;
+}'''
+        probes = validate_probe_plan(ProbePlan(probes=[]), source, "C")
+        self.assertEqual([(probe["line_number"], probe["target"]) for probe in probes], [(12, "max_div")])
+        result = verify({"language": "C", "source": source, "probes": probes})
+        self.assertEqual(result["stdout"], "29")
+        self.assertEqual([(item["before"], item["after"], item["context_values"]["i"])
+                          for item in result["observations"]],
+                         [("0", "5", "5"), ("5", "7", "7"), ("7", "13", "13"), ("13", "29", "29")])
+        tutorial = build_verified_tutorial("C", source, probes, result["observations"], result["stdout"])
+        self.assertEqual([step.answer for step in tutorial.steps], ["5", "7", "13", "29", "29"])
+        self.assertTrue(all(step.line_number == 12 for step in tutorial.steps[:-1]))
+        self.assertIn("max_div 13 → 29", tutorial.annotated_code)
+        self.assertEqual(validate_tutorial(tutorial.model_dump(), "C", source).steps[-1].answer, "29")
+
     def test_three_questions_from_repeated_changes_in_four_languages(self):
         samples = [
             ("C", '#include <stdio.h>\nint main(){\n int x=0;\n for(int i=0;i<3;i++){\n  x=x+i+1;\n }\n printf("%d",x);\n}', 5, ("gcc",)),
