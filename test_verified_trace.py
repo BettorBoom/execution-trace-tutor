@@ -52,6 +52,28 @@ int main(void) {
         self.assertIn("조건이 참이 된 1번째 대입 실행", tutorial.annotated_code)
         self.assertEqual(validate_tutorial(tutorial.model_dump(), "C", source).steps[-1].answer, "29")
 
+    @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")
+    def test_output_updates_survive_extra_model_probes(self):
+        source = '''#include <stdio.h>
+int main(void) {
+ int m=0,a=0,b=0,c=0,i;
+ a=a+1;
+ b=b+1;
+ c=c+1;
+ for(i=2;i<8;i++)
+  if(i==2 || i==3 || i==5 || i==7) m=i;
+ printf("%d",m);
+}'''
+        probes = [
+            {"id": index, "line_number": line, "target": target,
+             "context_exprs": ["i"] if target == "m" else []}
+            for index, (line, target) in enumerate(((4, "a"), (5, "b"), (6, "c"), (8, "m")))
+        ]
+        result = verify({"language": "C", "source": source, "probes": probes})
+        tutorial = build_verified_tutorial("C", source, probes, result["observations"], result["stdout"])
+        self.assertEqual([step.answer for step in tutorial.steps], ["2", "3", "5", "7", "7"])
+        self.assertEqual([step.line_number for step in tutorial.steps], [8, 8, 8, 8, 9])
+
     def test_three_questions_from_repeated_changes_in_four_languages(self):
         samples = [
             ("C", '#include <stdio.h>\nint main(){\n int x=0;\n for(int i=0;i<3;i++){\n  x=x+i+1;\n }\n printf("%d",x);\n}', 5, ("gcc",)),

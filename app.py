@@ -23,7 +23,7 @@ from pygments.lexers import get_lexer_by_name
 from trace_worker import _inline_if_assignment
 from verified_trace import (
     MAX_SOURCE_BYTES, ProbePlan, TraceError, plan_prompt, run_isolated_trace,
-    validate_probe_plan,
+    validate_probe_plan, _output_assignment,
 )
 
 from storage import (
@@ -460,9 +460,26 @@ def build_verified_tutorial(
                 delta = 1
             return (delta, -int(event["occurrence"]))
         selected.append(max(changed, key=importance))
-    # 같은 실행 행의 같은 회차를 별칭·공백만 바꿔 다시 묻지 않는다.
+    # 최종 출력 변수의 조건부 갱신은 다른 후보가 많아도 네 번까지 먼저 보존한다.
+    output_assignment = _output_assignment(source, language)
     unique_events: dict[tuple[int, int], dict[str, Any]] = {}
+    primary_changes: set[tuple[str, str]] = set()
+    if output_assignment and _inline_if_assignment(lines[output_assignment[0] - 1]):
+        for event in sorted(candidates, key=lambda item: int(item.get("event_index", item["line_number"]))):
+            if (event["line_number"], event["target"]) != output_assignment[:2]:
+                continue
+            change = (str(event["before"]), str(event["after"]))
+            if change in primary_changes:
+                continue
+            primary_changes.add(change)
+            unique_events[(int(event["line_number"]), int(event["occurrence"]))] = event
+            if len(primary_changes) == 4:
+                break
+    # 같은 실행 행의 같은 회차를 별칭·공백만 바꿔 다시 묻지 않는다.
+    initial_limit = 4 if len(primary_changes) == 4 else 6
     for event in sorted(selected, key=lambda item: len(item.get("context_values", {})), reverse=True):
+        if len(unique_events) >= initial_limit:
+            break
         unique_events.setdefault((int(event["line_number"]), int(event["occurrence"])), event)
     # 한 줄이 여러 번 실행됐다면 서로 다른 값 변화·실행 조건을 추가로 묻는다.
     # 같은 전후 값과 조건을 되풀이하는 회차는 문항 수를 채우려고 복제하지 않는다.
