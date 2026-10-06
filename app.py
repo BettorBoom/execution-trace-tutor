@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
+from trace_worker import _inline_if_assignment
 from verified_trace import (
     MAX_SOURCE_BYTES, ProbePlan, TraceError, plan_prompt, run_isolated_trace,
     validate_probe_plan,
@@ -245,10 +246,13 @@ def check_calculations(changes: list[StateChange], step_number: int) -> None:
 def review_code(source: str, language: str, notes: list[LineNote], steps: list[TraceStep]) -> str:
     """원본 뒤에 행별 메모를 붙여 문자열·전처리기 내용을 보존한다."""
     marker = "#" if language == "Python" else "//"
+    lines = source.split("\n")
     all_notes = [(item.line_number, item.note) for item in notes]
     for step in steps:
         for change in step.changes:
             detail = f"{step.context}: {change.target} {change.before} → {change.after}"
+            if step.verified_fact and _inline_if_assignment(lines[step.line_number - 1]):
+                detail += "; 이 회차에는 if 조건이 참이어서 대입 실행"
             if step.verified_fact:
                 context_values = step.verified_fact.get("context_values", {})
                 if context_values:
@@ -505,14 +509,15 @@ def build_verified_tutorial(
             if expression != target and re.fullmatch(r"[A-Za-z_]\w*", expression)
             and re.fullmatch(r"-?\d+", str(value))
         ]
-        context = f"{occurrence}번째 실행"
+        conditional_assignment = _inline_if_assignment(lines[line_number - 1]) is not None
+        context = f"조건이 참이 된 {occurrence}번째 대입 실행" if conditional_assignment else f"{occurrence}번째 실행"
         if conditions:
             context += " (실행 직전 " + ", ".join(conditions) + ")"
         change = StateChange(target=target, before=before, after=after, calculations=[])
         explanation = (
-            f"{line_number}행의 {occurrence}번째 실행에서 `{target}`의 값이 "
-            f"{before} → {after}로 바뀝니다."
-        )
+            f"{line_number}행에서 `if` 조건이 참이 된 {occurrence}번째 회차에 "
+            if conditional_assignment else f"{line_number}행의 {occurrence}번째 실행에서 "
+        ) + f"`{target}`의 값이 {before} → {after}로 바뀝니다."
         context_values = [
             f"`{expression}` = {value}"
             for expression, value in event.get("context_values", {}).items()
@@ -1466,7 +1471,7 @@ def main() -> None:
     initialize_state()
     st.html(contact_html(setting("CONTACT_EMAIL") or DEFAULT_CONTACT_EMAIL))
     st.title("다국어 실행 추적 튜터")
-    st.caption("C · C++ · Java · Python | 앱 버전 4.7 · 실행 검증")
+    st.caption("C · C++ · Java · Python | 앱 버전 4.8 · 실행 검증")
 
     owner = google_owner(st.user)
     if not owner:
