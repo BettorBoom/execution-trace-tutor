@@ -200,7 +200,8 @@ def question_for(kind: str, line_number: int, target: str, context: str) -> str:
     if kind == "value_before":
         return f"{prefix}{line_number}행 실행 직전 `{target}`의 값은 무엇인가요? 선택지에서 값 하나를 고르세요."
     if kind == "output_character":
-        return f"{prefix}{line_number}행에서 `{target}`의 출력 문자는 무엇인가요?"
+        return (f"{prefix}{line_number}행에서 `{target}`의 출력 문자는 무엇인가요?"
+                if context else f"최종 표준 출력의 {target}는 무엇인가요?")
     if kind == "output_length":
         return "프로그램이 출력한 글자는 모두 몇 개인가요? 줄바꿈도 한 글자로 셉니다."
     if kind == "normal_exit":
@@ -261,7 +262,8 @@ def review_code(source: str, language: str, notes: list[LineNote], steps: list[T
         if step.question_kind == "program_output" and step.verified_fact:
             all_notes.append((step.line_number, f"검증된 최종 표준 출력: {step.answer}"))
         if step.question_kind == "output_character" and step.verified_fact:
-            all_notes.append((step.line_number, f"{step.target}: {step.answer} 출력"))
+            label = step.target if step.context else f"전체 표준 출력의 {step.target}"
+            all_notes.append((step.line_number, f"{label}: {step.answer} 출력"))
     comments = [
         f"{marker} {line_number}행: {note.replace(chr(10), ' ').replace(chr(13), ' ')}"
         for line_number, note in all_notes
@@ -572,7 +574,7 @@ def build_verified_tutorial(
         for index, character in enumerate(stdout):
             if len(steps) >= MIN_NEW_STEPS or not character.isprintable() or character.isspace():
                 continue
-            target = char_args.group(index + 1).strip() if char_args and index < 2 else f"표준 출력의 {index + 1}번째 문자"
+            target = char_args.group(index + 1).strip() if char_args and index < 2 else f"{index + 1}번째 문자"
             context = f"{index + 1}번째 %c" if char_args and index < 2 else ""
             pointer_move = re.fullmatch(r"\*\(\s*([A-Za-z_]\w*)\s*([+-])\s*(\d+)\s*\)", target)
             explanation = f"격리 실행에서 {index + 1}번째로 출력된 문자는 {character}입니다."

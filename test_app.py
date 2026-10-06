@@ -236,6 +236,12 @@ class TutorialTests(unittest.TestCase):
                 self.assertEqual(tutorial.steps[-1].question_kind, "program_output")
                 self.assertTrue(all(len(step.choices) == 3 for step in tutorial.steps))
 
+    def test_multiple_output_lines_are_not_attributed_to_the_last_line(self):
+        source = "print('A')\nprint('B')"
+        tutorial = build_verified_tutorial("Python", source, [], [], "A\nB\n")
+        self.assertEqual([step.answer for step in tutorial.steps[:2]], ["A", "B"])
+        self.assertTrue(all("2행에서" not in step.question for step in tutorial.steps[:2]))
+
     def test_malformed_json_fails_before_sandbox(self):
         malformed = SimpleNamespace(output_parsed=None, status="completed", output_text="{broken")
         with patch("app.OpenAI") as client_class, patch("app.run_isolated_trace") as sandbox:
