@@ -46,10 +46,11 @@ int main(void) {
         self.assertTrue(all(step.line_number == 12 for step in tutorial.steps[:-1]))
         self.assertIn("조건이 참이 된 1번째 대입 실행", tutorial.steps[0].question)
         self.assertIn("실행 직전 i=5", tutorial.steps[0].question)
-        self.assertIn("`if` 조건이 참", tutorial.steps[0].explanation)
+        self.assertIn("`(isPrime(i) == 1 && number % i == 0)`이 참", tutorial.steps[0].explanation)
         self.assertIn("0 → 5", tutorial.steps[0].explanation)
         self.assertIn("max_div 13 → 29", tutorial.annotated_code)
         self.assertIn("조건이 참이 된 1번째 대입 실행", tutorial.annotated_code)
+        self.assertIn("조건 (isPrime(i) == 1 && number % i == 0) 참", tutorial.annotated_code)
         self.assertEqual(validate_tutorial(tutorial.model_dump(), "C", source).steps[-1].answer, "29")
 
     @unittest.skipUnless(shutil.which("gcc"), "C 컴파일러 필요")

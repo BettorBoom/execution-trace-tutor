@@ -246,10 +246,14 @@ def check_calculations(changes: list[StateChange], step_number: int) -> None:
 def review_code(source: str, language: str, notes: list[LineNote], steps: list[TraceStep]) -> str:
     """원본 뒤에 행별 메모를 붙여 문자열·전처리기 내용을 보존한다."""
     marker = "#" if language == "Python" else "//"
+    lines = source.split("\n")
     all_notes = [(item.line_number, item.note) for item in notes]
     for step in steps:
         for change in step.changes:
             detail = f"{step.context}: {change.target} {change.before} → {change.after}"
+            inline = _inline_if_assignment(lines[step.line_number - 1]) if step.verified_fact else None
+            if inline and len(inline[0]) <= 120:
+                detail += f"; 조건 {inline[0][2:].strip()} 참"
             if step.verified_fact:
                 context_values = step.verified_fact.get("context_values", {})
                 if context_values:
@@ -523,13 +527,16 @@ def build_verified_tutorial(
             if expression != target and re.fullmatch(r"[A-Za-z_]\w*", expression)
             and re.fullmatch(r"-?\d+", str(value))
         ]
-        conditional_assignment = _inline_if_assignment(lines[line_number - 1]) is not None
+        inline = _inline_if_assignment(lines[line_number - 1])
+        conditional_assignment = inline is not None
         context = f"조건이 참이 된 {occurrence}번째 대입 실행" if conditional_assignment else f"{occurrence}번째 실행"
         if conditions:
             context += " (실행 직전 " + ", ".join(conditions) + ")"
         change = StateChange(target=target, before=before, after=after, calculations=[])
+        condition_text = inline[0][2:].strip() if inline else ""
+        condition_label = f"조건 `{condition_text}`이 참이 된" if len(condition_text) <= 120 else "`if` 조건이 참이 된"
         explanation = (
-            f"{line_number}행에서 `if` 조건이 참이 된 {occurrence}번째 회차에 "
+            f"{line_number}행에서 {condition_label} {occurrence}번째 회차에 "
             if conditional_assignment else f"{line_number}행의 {occurrence}번째 실행에서 "
         ) + f"`{target}`의 값이 {before} → {after}로 바뀝니다."
         context_values = [
